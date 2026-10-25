@@ -240,3 +240,21 @@ func (s *Server) newRoom(id string) *room {
 	}
 	return r
 }
+
+// announce tells the room's Signaler, if it listens, that user joined or left.
+func (s *Server) announce(r *room, user string, joined bool) {
+	n, ok := s.sig.(PeerNotifier)
+	if !ok {
+		return
+	}
+	r.mu.Lock()
+	everyone := make([]string, 0, len(r.peers))
+	for u, p := range r.peers {
+		if !p.relay {
+			everyone = append(everyone, u)
+		}
+	}
+	r.mu.Unlock()
+	sort.Strings(everyone)
+	_ = n.Peer(r.id, user, joined, everyone)
+}

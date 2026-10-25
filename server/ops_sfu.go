@@ -83,7 +83,8 @@ func (s *Server) registerSFU() {
 		if err != nil {
 			return nil, err
 		}
-		return map[string]any{"type": "answer", "sdp": ans.SDP, "e2ee": v.E2EE}, nil
+		// peers is who is in the room now, so a newcomer need not wait for events.
+		return map[string]any{"type": "answer", "sdp": ans.SDP, "e2ee": v.E2EE, "peers": s.SFU.Peers(v.ID)}, nil
 	})
 	sf("answer", false, func(o *opCtx, v calls.View, raw json.RawMessage) (any, error) {
 		in, err := sdp(raw)

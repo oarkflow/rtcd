@@ -95,3 +95,29 @@ func TestAManagedRoomRefusesPlaintextAndUsersCannotOpenOne(t *testing.T) {
 		t.Fatalf("a user opened a room: %v", err)
 	}
 }
+
+func TestPeopleInARoomHearWhoComesAndGoes(t *testing.T) {
+	s := start(t, nil)
+	if _, err := s.acme.OpenRoom(bg, client.RoomSpec{ID: "r2", Members: []string{"ann", "ben", "cy"}}); err != nil {
+		t.Fatal(err)
+	}
+	ann, ben := s.dial(s.acme, "ann"), s.dial(s.acme, "ben")
+	var a, b map[string]any
+	ann.must("sfu.join", map[string]any{"call": "r2", "sdp": offerSDP(t), "e2ee": true}, &a)
+	if peers, _ := a["peers"].([]any); len(peers) != 1 || peers[0] != "ann" {
+		t.Fatalf("the first to join sees only themselves: %v", a["peers"])
+	}
+	ben.must("sfu.join", map[string]any{"call": "r2", "sdp": offerSDP(t), "e2ee": true}, &b)
+	if peers, _ := b["peers"].([]any); len(peers) != 2 {
+		t.Fatalf("the second sees both: %v", b["peers"])
+	}
+	ev := ann.next("sfu.peer")
+	if field(ev.Data, "user") != "ben" || field(ev.Data, "state") != "joined" {
+		t.Fatalf("event: %s", ev.Data)
+	}
+	ben.must("sfu.leave", map[string]any{"call": "r2"}, nil)
+	ev = ann.next("sfu.peer")
+	if field(ev.Data, "user") != "ben" || field(ev.Data, "state") != "left" {
+		t.Fatalf("event: %s", ev.Data)
+	}
+}

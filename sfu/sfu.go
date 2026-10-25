@@ -579,6 +579,13 @@ type pendingOffer struct {
 	tries int
 }
 
+// PeerNotifier is an optional extra for a Signaler: it is told whenever a person
+// joins or leaves a room, with everyone in the room after the change. A person
+// who is only reconnecting (inside ReconnectGrace) has not left.
+type PeerNotifier interface {
+	Peer(room, user string, joined bool, everyone []string) error
+}
+
 // SpeakerNotifier is an optional extra for a Signaler: it is told whenever the
 // dominant speaker of a room changes ("" when nobody is speaking), with the
 // participants to tell.
@@ -786,6 +793,9 @@ func (s *Server) join(ctx context.Context, roomID, user string, offer webrtc.Ses
 	r.peers[user] = p
 	r.mu.Unlock()
 	joined = true
+	if relay == nil {
+		s.announce(r, user, true)
+	}
 	// Existing tracks reach the newcomer by a server offer, which the newcomer
 	// answers like any other renegotiation. But not yet: the newcomer is still
 	// applying the answer we are about to return, and an offer that overtook it
@@ -1523,7 +1533,8 @@ func (p *peer) close() {
 
 		r := p.room
 		r.mu.Lock()
-		if r.peers[p.user] == p {
+		removed := r.peers[p.user] == p
+		if removed {
 			delete(r.peers, p.user)
 		}
 		for id, pub := range r.pubs {
@@ -1536,6 +1547,9 @@ func (p *peer) close() {
 		nobody := r.peopleLocked() == 0
 		casc := r.cascade
 		r.mu.Unlock()
+		if removed && !p.relay {
+			p.srv.announce(r, p.user, false)
+		}
 		r.reselect(time.Now(), false) // someone left: the next speaker takes their place
 		for _, o := range others {
 			o.scheduleRenegotiate()

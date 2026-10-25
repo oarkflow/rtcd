@@ -358,6 +358,20 @@ func (s *Server) Speaker(call, speaker string, participants []string) error {
 	return nil
 }
 
+// Peer implements sfu.PeerNotifier: everyone in the room hears who came or went.
+func (s *Server) Peer(call, user string, joined bool, everyone []string) error {
+	state := "left"
+	if joined {
+		state = "joined"
+	}
+	for _, u := range everyone {
+		if u != user {
+			_ = s.emit(call, u, "sfu.peer", map[string]any{"call_id": call, "user": user, "state": state})
+		}
+	}
+	return nil
+}
+
 // Recording implements sfu.RecordingNotifier.
 func (s *Server) Recording(call string, on bool, by string, participants []string) error {
 	tenant, _ := s.tenantOf(call)
