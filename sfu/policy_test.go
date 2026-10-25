@@ -3,6 +3,7 @@ package sfu
 import (
 	"context"
 	"fmt"
+	"os"
 	"testing"
 	"time"
 
@@ -182,8 +183,10 @@ func TestAHundredPeopleShareOneRoom(t *testing.T) {
 // connection carries ninety-nine sections. This is not a recommendation, it is
 // the measurement that justifies the policy above; it must still work.
 func TestAHundredPeopleWithNoPolicyStillSettle(t *testing.T) {
-	if testing.Short() {
-		t.Skip("a hundred real peer connections")
+	if os.Getenv("RTCD_ALL_TO_ALL") == "" {
+		// Ninety-nine sections in each of a hundred connections is a measurement, not a regression test: about a second
+		// normally, and minutes under the race detector. Run it with RTCD_ALL_TO_ALL=1.
+		t.Skip("set RTCD_ALL_TO_ALL=1 to run the all-to-all measurement")
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
 	defer cancel()
