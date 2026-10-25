@@ -8,6 +8,8 @@ go build -o rtcd ./cmd/rtcd
 ./rtcd -config rtcd.bcl
 ```
 
+A `Dockerfile` is included (`docker build -t rtcd .`, mount `rtcd.bcl` at `/etc/rtcd/`, publish the signaling port and exactly the UDP range from the config).
+
 Build from a checkout. `go install github.com/oarkflow/rtcd/cmd/rtcd@…` does not work: `go.mod` replaces `pion/ice` with a fork (see *ICE restarts*), and Go refuses to install a module that has a `replace`.
 
 ## How applications use it
@@ -208,7 +210,7 @@ Service-level: keys are compared in constant time over their hashes; tokens are 
 - **Only SQLite** is linked into the binary (the stores speak postgres/mysql dialects).
 - Webhooks to the backend (it learns of events by holding a socket as a user).
 - No per-tenant quotas, only per-user limits.
-- Safari and Firefox are untested.
+- Safari and Firefox: the managed-room flow and encrypted group calls were run in Playwright's WebKit and Firefox (three browsers, key rotation on a leave, a removal) from the Aura repository's `web/e2e/sfu`, with fake cameras. That is the engines, not Safari itself, and not a phone.
 
 ## Tests
 
