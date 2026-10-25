@@ -324,7 +324,7 @@ func (s *Server) OpenCascade(ctx context.Context, roomID, self string, up Upstre
 			s.mu.Unlock()
 			return nil, ErrRoomFull
 		}
-		r = &room{id: roomID, peers: map[string]*peer{}, pubs: map[string]*published{}, det: newSpeakerDetector()}
+		r = s.newRoom(roomID)
 		s.rooms[roomID] = r
 	}
 	s.mu.Unlock()

@@ -73,6 +73,26 @@ conn.Call(ctx, "group.call", map[string]any{"group": id}, &started)
 for ev := range conn.Events() { … }
 ```
 
+## Managed rooms (for a backend that owns membership)
+
+A backend that already knows who may be in a call, because it has its own groups, permissions and ringing, should not use `call.start` and `group.*`. It opens a **managed room** instead (service key only):
+
+| | |
+|---|---|
+| `room.open {id, kind, members[], e2ee, max_peers, last_n_video, last_n_audio}` | creates the room under the backend's own id, or admits `members` to it if it is open. `POST /v1/rooms/open` |
+| `room.admit {id, members[]}` | lets more people in, or back in |
+| `room.remove {id, members[]}` | takes people out **and disconnects them from the media at once**; they get a `room.removed` event |
+| `room.close {id}` | ends the room for everyone |
+| `room.get {id}` | who is admitted and who is connected to the media |
+
+An admitted user goes straight to `sfu.join`: no ringing, no answering step. A user who was not admitted is told what a stranger is told. Nobody but the backend can end the room (`call.end` from a member only leaves the media). The `max_invitees` cap does not apply; `max_room_members` (default 1000) does. Encryption is required exactly as for any call, and `sfu.record.*` is unavailable (there is no caller to own a recording). Ids are unique across tenants: another tenant opening a live id is refused.
+
+## Large rooms: last N
+
+Sending a hundred people to a hundred people is neither possible (a hundred media sections in every connection) nor useful (nobody watches a hundred tiles). A room can set `last_n_video` and `last_n_audio` (or the service defaults, `last_n_video` / `last_n_audio` in `rtcd.bcl`): each viewer is then sent only the people who **spoke most recently**, plus whoever the viewer pinned (`sfu.prefs {pinned}`) and the current speaker. Speaking brings a person in; whoever has been quiet longest leaves. Everyone remains in the room and nobody is excluded from speaking. A change in the set is negotiated with every viewer, and changes close together (a hundred people arriving) are coalesced into one offer per viewer, with a wait that grows with the size of the room and none in a room of sixteen or fewer.
+
+Measured in-process with 100 real Pion peers, each publishing a microphone, `last_n_audio 16`: all connected and negotiated in about 0.7 s, 2.4 offers per person (`go test -run AHundredPeopleShare -v ./sfu`). That proves the control plane and the selection; it is loopback, audio only, and says nothing about bandwidth or CPU under real video. Measure that with your own load.
+
 ## Groups
 
 A user can make groups, and call them. The creator owns the group; the owner can make members admins; owners and admins add and remove members; anyone can leave except the owner, who must hand the group over or delete it. Only members can see a group, and a group that exists looks exactly like one that does not. `group.call` rings every other member, or, if the group already has a call under way, puts the caller into it. Two members calling at the same moment end up in one call. Limits: `groups.max_owned` (100 per user), `groups.max_members` (200).
@@ -148,6 +168,7 @@ udp_port_max 50100
 | `ring_timeout`, `max_invitees` | `"45s"`, 20 |
 | `groups { max_owned max_members }` | |
 | `limits { shards max_connections max_connections_per_user writer_queue ops_per_second ops_burst relay_per_second relay_burst }` | |
+| `last_n_video`, `last_n_audio`, `max_room_members` | large rooms (above) |
 | `udp_port_min`, `udp_port_max`, `public_ips`, `max_peers`, `max_rooms`, `reconnect_grace`, `offer_timeout`, `initial_kbps` | SFU |
 | `interfaces` | only offer addresses on these network interfaces, e.g. `["eth0"]`. Default: all |
 | `network_types` | `["udp4"]`, `["udp6"]` or both (default). A server with no usable IPv6 should say `["udp4"]`: every candidate pair that cannot work is a connectivity check wasted |

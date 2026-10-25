@@ -47,8 +47,12 @@ func (s *Server) Prefer(roomID, user string, pr Prefs) error {
 		clean.Streams[who] = sp
 	}
 	p.fmu.Lock()
+	pinChanged := p.prefs.Pinned != clean.Pinned
 	p.prefs = clean
 	p.fmu.Unlock()
+	if pinChanged && p.room.sel.Load() != nil {
+		p.scheduleRenegotiate() // a pinned person is sent even outside the last N
+	}
 	go p.adapt(time.Now())
 	return nil
 }
@@ -318,12 +322,30 @@ func (s *Server) detectSpeaker(r *room, now time.Time) {
 		users = append(users, u)
 	}
 	r.mu.Unlock()
+	r.noteSpeech(now, loud)
 	cur, changed := r.det.update(now, loud)
 	if !changed {
 		return
 	}
 	r.speaker.Store(cur)
+	r.reselect(now, false)
 	if n, ok := s.sig.(SpeakerNotifier); ok {
 		_ = n.Speaker(r.id, cur, users)
 	}
+}
+
+// noteSpeech remembers who has been talking, for the last-N selection.
+func (r *room) noteSpeech(now time.Time, loud map[string]int) {
+	r.mu.Lock()
+	for u, l := range loud {
+		if l >= speechLoudness {
+			r.spoke[u] = now
+		}
+	}
+	for u := range r.spoke {
+		if _, here := loud[u]; !here {
+			delete(r.spoke, u)
+		}
+	}
+	r.mu.Unlock()
 }

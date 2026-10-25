@@ -31,6 +31,9 @@ func routes() []route {
 		{"GET", "/v1/groups", "group.list", ""},
 		{"GET", "/v1/groups/:id", "group.get", "group"},
 	}
+	for _, a := range []string{"open", "admit", "remove", "close", "get"} {
+		r = append(r, route{"POST", "/v1/rooms/" + a, "room." + a, ""})
+	}
 	for _, a := range []string{"answer", "decline", "end", "invite", "signal", "e2ee"} {
 		r = append(r, route{"POST", "/v1/calls/:id/" + a, "call." + a, "call"})
 	}

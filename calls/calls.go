@@ -133,6 +133,8 @@ type Options struct {
 	RingTimeout time.Duration
 	// MaxInvitees caps the people one call can invite. Default 20.
 	MaxInvitees int
+	// MaxRoomMembers caps the people a managed room (see OpenRoom) can admit. Default 1000.
+	MaxRoomMembers int
 	// RequireE2EE makes every call end-to-end encrypted; a call cannot be started
 	// without it. (The server cannot make a browser encrypt, but it refuses the
 	// server-side features that need plaintext and makes each client declare it.)
@@ -561,6 +563,9 @@ func (s *Store) End(ctx context.Context, by Actor, id string) (Call, error) {
 	if state == "declined" || state == "left" {
 		return c, nil
 	}
+	if c.Managed() {
+		return c, nil // leaving a managed room is leaving the SFU; the backend decides who is admitted and when it ends
+	}
 	if c.Mode == P2P || by.ID == c.Initiator {
 		reason := "ended"
 		if c.Status == Ringing {
@@ -692,6 +697,7 @@ func (s *Store) Sweep(ctx context.Context) (int, error) {
 type View struct {
 	ID, Tenant, Mode, Status, Initiator, Group string
 	E2EE                                       bool
+	Managed                                    bool
 	State                                      string // the actor's state: invited, joined, declined, left
 	Participants                               []Participant
 }
@@ -704,7 +710,7 @@ func (s *Store) Peek(ctx context.Context, by Actor, id string) (View, error) {
 		return View{}, err
 	}
 	return View{ID: c.ID, Tenant: c.Tenant, Mode: c.Mode, Status: c.Status, Initiator: c.Initiator, Group: c.Group,
-		E2EE: c.E2EE, State: state, Participants: c.Participants}, nil
+		E2EE: c.E2EE, Managed: c.Managed(), State: state, Participants: c.Participants}, nil
 }
 
 // addParticipants rings users into a call that is not over. People who left or

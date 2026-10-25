@@ -81,11 +81,15 @@ type Config struct {
 	// default every one except loopback, link-local, tunnels and virtual ones.
 	Interfaces         []string
 	MaxPeers, MaxRooms int
-	ReconnectGrace     time.Duration
-	OfferTimeout       time.Duration
-	InitialKbps        int
-	RecordDir          string
-	RecordLayer        string
+	// LastNVideo and LastNAudio are how many people's video and audio each
+	// viewer is sent in a room (0: everyone). MaxRoomMembers is how many people a
+	// managed room can admit.
+	LastNVideo, LastNAudio, MaxRoomMembers int
+	ReconnectGrace                         time.Duration
+	OfferTimeout                           time.Duration
+	InitialKbps                            int
+	RecordDir                              string
+	RecordLayer                            string
 
 	// Connections.
 	// Shards splits connections over independent hubs so connecting and
@@ -201,7 +205,7 @@ func New(ctx context.Context, cfg Config) (*Server, error) {
 	s.Store, err = calls.Open(ctx, cfg.DB, calls.Options{
 		Dialect: cfg.Dialect, Rebind: cfg.Rebind, Notifier: s,
 		ICE:         calls.ICEConfig{STUN: cfg.STUN, TURN: cfg.TURN, Secret: cfg.TURNSecret, TTL: cfg.TURNTTL},
-		RingTimeout: cfg.RingTimeout, MaxInvitees: cfg.MaxInvitees, RequireE2EE: !cfg.AllowPlaintext,
+		RingTimeout: cfg.RingTimeout, MaxInvitees: cfg.MaxInvitees, MaxRoomMembers: cfg.MaxRoomMembers, RequireE2EE: !cfg.AllowPlaintext,
 		Now: cfg.Now,
 	})
 	if err != nil {
@@ -218,7 +222,7 @@ func New(ctx context.Context, cfg Config) (*Server, error) {
 	}
 	s.SFU, err = sfu.New(sfu.Config{
 		ICEServers: ice, UDPPortMin: cfg.UDPPortMin, UDPPortMax: cfg.UDPPortMax, PublicIPs: cfg.PublicIPs, NetworkTypes: cfg.NetworkTypes, Interfaces: cfg.Interfaces,
-		MaxPeers: cfg.MaxPeers, MaxRooms: cfg.MaxRooms, ReconnectGrace: cfg.ReconnectGrace, OfferTimeout: cfg.OfferTimeout,
+		MaxPeers: cfg.MaxPeers, MaxRooms: cfg.MaxRooms, LastNVideo: cfg.LastNVideo, LastNAudio: cfg.LastNAudio, ReconnectGrace: cfg.ReconnectGrace, OfferTimeout: cfg.OfferTimeout,
 		InitialKbps: cfg.InitialKbps, RecordDir: cfg.RecordDir, RecordLayer: cfg.RecordLayer,
 	}, s)
 	if err != nil {
@@ -350,6 +354,20 @@ func (s *Server) Candidate(user, call string, c webrtc.ICECandidateInit) error {
 func (s *Server) Speaker(call, speaker string, participants []string) error {
 	for _, u := range participants {
 		_ = s.emit(call, u, "sfu.speaker", map[string]any{"call_id": call, "speaker": speaker})
+	}
+	return nil
+}
+
+// Peer implements sfu.PeerNotifier: everyone in the room hears who came or went.
+func (s *Server) Peer(call, user string, joined bool, everyone []string) error {
+	state := "left"
+	if joined {
+		state = "joined"
+	}
+	for _, u := range everyone {
+		if u != user {
+			_ = s.emit(call, u, "sfu.peer", map[string]any{"call_id": call, "user": user, "state": state})
+		}
 	}
 	return nil
 }
