@@ -1,10 +1,14 @@
 # rtcd: the call service
 
-Audio and video calls as an independent service: peer-to-peer or through a Pion **SFU** (simulcast, VP9 SVC, active speaker, recording), **end-to-end encrypted** by default, with users' own **groups** and a complete, tamper-evident **audit log**. It knows nothing about the applications that use it. [`contrib/rtc`](../contrib/rtc) is REF's client; [`client/`](client) is a Go client; the protocol below works from anything.
+Audio and video calls as an independent service: peer-to-peer or through a Pion **SFU** (simulcast, VP9 SVC, active speaker, recording), **end-to-end encrypted** by default, with users' own **groups** and a complete, tamper-evident **audit log**. It knows nothing about the applications that use it. [`contrib/rtc`](https://github.com/oarkflow/ref/tree/main/contrib/rtc) is REF's client; [`client/`](client) is a Go client; the protocol below works from anything.
 
 ```
-rtcd -config rtcd.bcl
+git clone git@github.com:oarkflow/rtcd.git && cd rtcd
+go build -o rtcd ./cmd/rtcd
+./rtcd -config rtcd.bcl
 ```
+
+Build from a checkout. `go install github.com/oarkflow/rtcd/cmd/rtcd@…` does not work: `go.mod` replaces `pion/ice` with a fork (see *ICE restarts*), and Go refuses to install a module that has a `replace`.
 
 ## How applications use it
 
@@ -42,7 +46,7 @@ The first event, `ready`, says who you are and when your token ends. Send `{"typ
 | `call.start` `{to[], kind, mode, e2ee}` · `call.get` · `call.answer` · `call.decline` · `call.end` · `call.invite {users[]}` | calls. All take `call` (the id) except `call.start` |
 | `call.signal {call, to, type, data}` | relay SDP/ICE in a p2p call |
 | `call.e2ee {call, to, data}` | relay an opaque key-exchange message (≤ 16 KiB) |
-| `sfu.join {call, sdp, e2ee}` · `sfu.answer` · `sfu.candidate` · `sfu.ready` · `sfu.restart` · `sfu.resync` · `sfu.prefs` · `sfu.stats` · `sfu.sample` · `sfu.leave` · `sfu.record.start/stop/status` | group-call media signaling (see [docs/calls.md](../docs/calls.md)) |
+| `sfu.join {call, sdp, e2ee}` · `sfu.answer` · `sfu.candidate` · `sfu.ready` · `sfu.restart` · `sfu.resync` · `sfu.prefs` · `sfu.stats` · `sfu.sample` · `sfu.leave` · `sfu.record.start/stop/status` | group-call media signaling (see [docs/calls.md](docs/calls.md)) |
 | `group.create {name, members[]}` · `group.get` · `group.list` · `group.rename` · `group.add` · `group.remove` · `group.role {user, role}` · `group.transfer {to}` · `group.delete` | groups; the others take `group` |
 | `group.call {group, kind, mode}` | start a call with the group, or join the one under way |
 | `ice` | STUN/TURN servers with a short-lived TURN credential |
@@ -161,17 +165,19 @@ Measured, with real Chrome forcing a restart of a healthy connection: **9 of 14 
 
 Things that did **not** help, each measured and removed: asking for keyframes harder, a larger ICE check budget, filtering candidates by interface name (it made things worse: on one machine the name `bridge100` was the browser's own network), hiding sequence gaps from the viewer, and a shorter keepalive.
 
-Maintenance: `rtcd/go.mod` uses `replace github.com/pion/ice/v4 => github.com/oarkflow/ice/v4 v4.4.8-oarkflow.1`. The fork keeps upstream's module path, which is what makes the `replace` work. When pion/webrtc is updated to need a newer pion/ice v4, re-apply the patch to that version on a new branch and tag (upstream's `main` is already `ice/v5`), or propose it upstream. `network_types` and `interfaces` are available if a deployment wants to offer fewer candidates.
+Maintenance: `go.mod` uses `replace github.com/pion/ice/v4 => github.com/oarkflow/ice/v4 v4.4.8-oarkflow.1`. The fork keeps upstream's module path, which is what makes the `replace` work. When pion/webrtc is updated to need a newer pion/ice v4, re-apply the patch to that version on a new branch and tag (upstream's `main` is already `ice/v5`), or propose it upstream. `network_types` and `interfaces` are available if a deployment wants to offer fewer candidates.
+
+**If you embed the `sfu` or `server` packages in your own program**, add the same line to *your* `go.mod`: a `replace` in a dependency is not inherited, and without it you get upstream `pion/ice` and the stall. (Programs that only use `client` or `auth` do not build the SFU and need nothing.)
 
 Server candidates can reach the client before the restart's answer does (they travel on the same socket and gathering is fast). A client must hold them until it has applied the answer, as the demo page does.
 
 ## Browser side
 
-`web/e2ee-core.js` and `web/e2ee-worker.js` are the encryption a browser needs for group calls. A worker must be served from the page's own origin, so the application copies both files next to its page (the demo does: `examples/realtime-platform/static`). `web/test` has the Node tests: `node --test web/test/e2ee-core.test.js`.
+`web/e2ee-core.js` and `web/e2ee-worker.js` are the encryption a browser needs for group calls. A worker must be served from the page's own origin, so the application copies both files next to its page (the [REF demo](https://github.com/oarkflow/ref/tree/main/examples/realtime-platform/static) does). `web/test` has the Node tests: `node --test web/test/e2ee-core.test.js`.
 
 ## Security model
 
-See the end-to-end encryption section of [docs/calls.md](../docs/calls.md): what is protected (media content, against the service itself), what is not (membership, timing, sizes, microphone loudness), and that the safety code is what defeats a service that is a man in the middle from first contact.
+See the end-to-end encryption section of [docs/calls.md](docs/calls.md): what is protected (media content, against the service itself), what is not (membership, timing, sizes, microphone loudness), and that the safety code is what defeats a service that is a man in the middle from first contact.
 
 Service-level: keys are compared in constant time over their hashes; tokens are HMAC-SHA256 signed, carry their scopes and expire, and a connection is closed when its token runs out unless refreshed; a browser must connect from an allowed origin; the service refuses to start with short secrets, duplicate keys, TURN without a secret, or half a UDP range; request bodies are capped at 64 KiB. The token travels in the WebSocket URL (browsers cannot set headers on one), so keep tokens short-lived and do not log query strings.
 
