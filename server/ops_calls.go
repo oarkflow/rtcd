@@ -20,6 +20,7 @@ func validUsers(users []string) error {
 func (s *Server) registerOps() {
 	s.registerAdmin()
 	s.registerCalls()
+	s.registerRooms()
 	s.registerSFU()
 	s.registerGroups()
 }

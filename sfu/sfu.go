@@ -80,6 +80,10 @@ type Config struct {
 	MaxPeers int
 	// MaxRooms bounds rooms on this node. Default 1000.
 	MaxRooms int
+	// LastNVideo and LastNAudio are how many people's video and audio each
+	// viewer is sent in a room that sets no policy of its own: the people who
+	// spoke last. 0 sends everyone (see Policy).
+	LastNVideo, LastNAudio int
 	// ReconnectGrace is how long a participant whose connection failed (a
 	// network switch, a tunnel, a closed laptop lid) keeps their place and their
 	// published tracks while they reconnect with an ICE restart. Default 45s.
@@ -134,6 +138,7 @@ type Server struct {
 	mu     sync.Mutex
 	rooms  map[string]*room
 	closed bool
+	pol    policies
 
 	stop chan struct{}
 	wg   sync.WaitGroup
@@ -471,9 +476,13 @@ type room struct {
 	peers map[string]*peer
 	pubs  map[string]*published
 
-	cascade *Cascade         // this node's link to the room's home node, if it is a leaf
-	e2ee    atomic.Bool      // the room is end-to-end encrypted: the server never has the keys
-	det     *speakerDetector // housekeeping only
+	srv     *Server
+	pol     atomic.Pointer[Policy]    // set by the backend; nil takes the server's defaults
+	sel     atomic.Pointer[selection] // who each viewer is sent; nil is everyone
+	spoke   map[string]time.Time      // when each person last spoke (guarded by mu)
+	cascade *Cascade                  // this node's link to the room's home node, if it is a leaf
+	e2ee    atomic.Bool               // the room is end-to-end encrypted: the server never has the keys
+	det     *speakerDetector          // housekeeping only
 	rec     atomic.Pointer[recording]
 	speaker atomic.Value // string: who is talking now
 }
@@ -555,6 +564,8 @@ type peer struct {
 
 	gmu   sync.Mutex
 	grace *time.Timer
+
+	scheduled atomic.Bool // a renegotiation is already waiting its turn
 
 	done chan struct{}
 	once sync.Once
@@ -701,7 +712,7 @@ func (s *Server) join(ctx context.Context, roomID, user string, offer webrtc.Ses
 			s.mu.Unlock()
 			return webrtc.SessionDescription{}, ErrRoomFull
 		}
-		r = &room{id: roomID, peers: map[string]*peer{}, pubs: map[string]*published{}, det: newSpeakerDetector()}
+		r = s.newRoom(roomID)
 		s.rooms[roomID] = r
 	}
 	s.mu.Unlock()
@@ -721,7 +732,7 @@ func (s *Server) join(ctx context.Context, roomID, user string, offer webrtc.Ses
 
 	r.mu.Lock()
 	old := r.peers[user]
-	if old == nil && relay == nil && r.peopleLocked() >= s.cfg.MaxPeers {
+	if old == nil && relay == nil && r.peopleLocked() >= r.effective(s.cfg).MaxPeers {
 		r.mu.Unlock()
 		return webrtc.SessionDescription{}, ErrRoomFull
 	}
@@ -1229,11 +1240,12 @@ func (p *peer) forwardAudio(pub *published, remote *webrtc.TrackRemote, receiver
 
 func (p *peer) notifyOthers() {
 	r := p.room
+	r.reselect(time.Now(), false) // a newcomer may belong to the last N
 	r.mu.Lock()
 	others := r.othersLocked(p.user)
 	r.mu.Unlock()
 	for _, o := range others {
-		go o.renegotiate()
+		o.scheduleRenegotiate()
 	}
 }
 
@@ -1298,6 +1310,7 @@ func (p *peer) prepareOffer() (webrtc.SessionDescription, bool) {
 	p.dirty = false
 
 	r := p.room
+	sel := r.sel.Load()
 	r.mu.Lock()
 	want := make(map[string]*published, len(r.pubs))
 	for id, pub := range r.pubs {
@@ -1306,6 +1319,9 @@ func (p *peer) prepareOffer() (webrtc.SessionDescription, bool) {
 		}
 		if p.relay && pub.owner.relay && pub.owner.relayNode == p.relayNode {
 			continue // what a leaf sent us is not sent back to it
+		}
+		if !sel.allows(p, pub.who, pub.kind == webrtc.RTPCodecTypeVideo) {
+			continue // outside the last N speakers, and not pinned
 		}
 		want[id] = pub
 	}
@@ -1520,8 +1536,9 @@ func (p *peer) close() {
 		nobody := r.peopleLocked() == 0
 		casc := r.cascade
 		r.mu.Unlock()
+		r.reselect(time.Now(), false) // someone left: the next speaker takes their place
 		for _, o := range others {
-			go o.renegotiate()
+			o.scheduleRenegotiate()
 		}
 		if nobody && casc != nil && !p.relay {
 			go casc.Close() // the last person left this node: stop relaying the room

@@ -90,6 +90,9 @@ type fileConfig struct {
 	Interfaces     []string `json:"interfaces"`
 	MaxPeers       int      `json:"max_peers"`
 	MaxRooms       int      `json:"max_rooms"`
+	LastNVideo     int      `json:"last_n_video"`
+	LastNAudio     int      `json:"last_n_audio"`
+	MaxRoomMembers int      `json:"max_room_members"`
 	ReconnectGrace string   `json:"reconnect_grace"`
 	OfferTimeout   string   `json:"offer_timeout"`
 	InitialKbps    int      `json:"initial_kbps"`
@@ -146,6 +149,7 @@ func build(fc fileConfig) (server.Config, []*sql.DB, error) {
 	cfg.UDPPortMin, cfg.UDPPortMax, cfg.PublicIPs = uint16(fc.UDPPortMin), uint16(fc.UDPPortMax), fc.PublicIPs
 	cfg.NetworkTypes, cfg.Interfaces = fc.NetworkTypes, fc.Interfaces
 	cfg.MaxPeers, cfg.MaxRooms, cfg.InitialKbps = fc.MaxPeers, fc.MaxRooms, fc.InitialKbps
+	cfg.LastNVideo, cfg.LastNAudio, cfg.MaxRoomMembers = fc.LastNVideo, fc.LastNAudio, fc.MaxRoomMembers
 	cfg.RecordDir, cfg.RecordLayer = fc.RecordDir, fc.RecordLayer
 	cfg.Dialect = "sqlite"
 	db, err := sql.Open("sqlite", fc.Database.DSN)
