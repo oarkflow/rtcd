@@ -72,6 +72,13 @@ type Options struct {
 	// MaxMembers caps the people in one group. Default 200.
 	MaxMembers int
 	Now        func() time.Time
+	// MaxManaged caps the people in one managed conversation. Default 1000.
+	MaxManaged int
+	// OnRemove is called once after people leave or are removed from a group or
+	// managed conversation; OnDelete after one is deleted. They run on the
+	// caller's goroutine and must not block.
+	OnRemove func(ctx context.Context, tenant, id string, users []string)
+	OnDelete func(ctx context.Context, tenant, id string)
 }
 
 // Store keeps groups in SQL.
@@ -91,6 +98,9 @@ func Open(ctx context.Context, db *sql.DB, o Options) (*Store, error) {
 	}
 	if o.MaxMembers <= 0 {
 		o.MaxMembers = 200
+	}
+	if o.MaxManaged <= 0 {
+		o.MaxManaged = 1000
 	}
 	if o.ValidUser == nil {
 		o.ValidUser = func(s string) bool {
@@ -117,6 +127,7 @@ func Open(ctx context.Context, db *sql.DB, o Options) (*Store, error) {
 			role VARCHAR(16) NOT NULL, added_at ` + key + ` NOT NULL, PRIMARY KEY (group_id, user_id))`,
 		`CREATE INDEX IF NOT EXISTS rtc_group_members_user ON rtc_group_members (user_id)`,
 		`CREATE INDEX IF NOT EXISTS rtc_groups_owner ON rtc_groups (tenant, owner)`,
+		`CREATE TABLE IF NOT EXISTS rtc_managed (id ` + key + ` PRIMARY KEY, tenant ` + key + ` NOT NULL)`,
 	} {
 		if err := dbx.DDL(ctx, db, o.Dialect, q); err != nil {
 			return nil, fmt.Errorf("groups: schema: %w", err)
@@ -186,7 +197,7 @@ func (s *Store) roleOf(ctx context.Context, q interface {
 	QueryRowContext(context.Context, string, ...any) *sql.Row
 }, by Actor, id string) (string, error) {
 	var role string
-	err := q.QueryRowContext(ctx, s.rebind(`SELECT m.role FROM rtc_group_members m JOIN rtc_groups g ON g.id = m.group_id WHERE g.id = $1 AND g.tenant = $2 AND m.user_id = $3`),
+	err := q.QueryRowContext(ctx, s.rebind(`SELECT m.role FROM rtc_group_members m JOIN rtc_groups g ON g.id = m.group_id WHERE g.id = $1 AND g.tenant = $2 AND m.user_id = $3 AND NOT EXISTS (SELECT 1 FROM rtc_managed x WHERE x.id = g.id)`),
 		id, by.Tenant, by.ID).Scan(&role)
 	if errors.Is(err, sql.ErrNoRows) {
 		return "", nil
@@ -313,7 +324,7 @@ func (s *Store) Members(ctx context.Context, by Actor, id string) ([]string, err
 
 // List returns the groups the caller belongs to, without their member lists.
 func (s *Store) List(ctx context.Context, by Actor) ([]Group, error) {
-	rows, err := s.db.QueryContext(ctx, s.rebind(`SELECT g.id, g.name, g.owner, g.created_at, g.updated_at FROM rtc_groups g JOIN rtc_group_members m ON m.group_id = g.id WHERE g.tenant = $1 AND m.user_id = $2 ORDER BY g.created_at, g.id LIMIT 500`), by.Tenant, by.ID)
+	rows, err := s.db.QueryContext(ctx, s.rebind(`SELECT g.id, g.name, g.owner, g.created_at, g.updated_at FROM rtc_groups g JOIN rtc_group_members m ON m.group_id = g.id WHERE g.tenant = $1 AND m.user_id = $2 AND NOT EXISTS (SELECT 1 FROM rtc_managed x WHERE x.id = g.id) ORDER BY g.created_at, g.id LIMIT 500`), by.Tenant, by.ID)
 	if err != nil {
 		return nil, err
 	}
@@ -469,6 +480,9 @@ func (s *Store) Remove(ctx context.Context, by Actor, id string, users []string)
 	if err != nil {
 		return Group{}, err
 	}
+	if len(gone) > 0 && s.o.OnRemove != nil {
+		s.o.OnRemove(ctx, by.Tenant, id, gone)
+	}
 	s.tell(ctx, by.Tenant, gone, "group.removed", map[string]any{"group": id, "by": by.ID}, by.ID)
 	s.tell(ctx, by.Tenant, userNames(left), "group.members_removed", map[string]any{"group": id, "users": gone, "by": by.ID}, by.ID)
 	if r := roles[by.ID]; r != "" && contains(gone, by.ID) {
@@ -587,6 +601,9 @@ func (s *Store) Delete(ctx context.Context, by Actor, id string) error {
 	}
 	if err := tx.Commit(); err != nil {
 		return err
+	}
+	if s.o.OnDelete != nil {
+		s.o.OnDelete(ctx, by.Tenant, id)
 	}
 	s.tell(ctx, by.Tenant, userNames(g.Members), "group.deleted", map[string]any{"group": id, "name": g.Name, "by": by.ID}, by.ID)
 	return nil

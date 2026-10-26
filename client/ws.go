@@ -277,7 +277,7 @@ func wireError(s string) error {
 
 func statusOf(code string) int {
 	switch code {
-	case "forbidden", "scope_missing", "service_key_required", "only_the_caller_can_record":
+	case "forbidden", "scope_missing", "service_key_required", "only_the_caller_can_record", "device_revoked", "too_late":
 		return 403
 	case "unauthenticated", "token_expired":
 		return 401
@@ -289,6 +289,8 @@ func statusOf(code string) int {
 		return 410
 	case "rate_limited", "room_full", "limit_reached", "too_many_connections":
 		return 429
+	case "stale_epoch", "rekey_required", "conflict", "id_taken", "members_without_keys":
+		return 409
 	case "call_not_active", "negotiating", "not_in_room", "answer_the_call_first", "already_recording",
 		"not_recording", "recording_unavailable_e2ee", "no_offer_outstanding":
 		return 409

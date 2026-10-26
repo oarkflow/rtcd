@@ -348,3 +348,23 @@ func (s *Server) upgrade(c fh.Ctx) error {
 	c.Locals("rtcd.sid", sid)
 	return sh.handler(c)
 }
+
+// connectedAmong returns those of users (but not except) that have a live
+// connection to this node.
+func (h *hubs) connectedAmong(tenant string, users []string, except string) []string {
+	var out []string
+	for _, u := range users {
+		if u == except {
+			continue
+		}
+		key := userKey(tenant, u)
+		sh := h.shardFor(key)
+		sh.mu.RLock()
+		n := len(sh.users[key])
+		sh.mu.RUnlock()
+		if n > 0 {
+			out = append(out, u)
+		}
+	}
+	return out
+}

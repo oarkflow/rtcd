@@ -36,6 +36,15 @@ func routes() []route {
 	for _, a := range []string{"open", "admit", "remove", "close", "get"} {
 		r = append(r, route{"POST", "/v1/rooms/" + a, "room." + a, ""})
 	}
+	for _, a := range []string{"open", "admit", "remove", "role", "close", "get", "policy"} {
+		r = append(r, route{"POST", "/v1/conversations/" + a, "conv." + a, ""})
+	}
+	for _, a := range []string{"publish", "revoke", "list"} {
+		r = append(r, route{"POST", "/v1/keys/" + a, "key." + a, ""})
+	}
+	for _, a := range []string{"get", "missing", "rotate", "grant"} {
+		r = append(r, route{"POST", "/v1/epochs/" + a, "epoch." + a, ""})
+	}
 	for _, a := range []string{"answer", "decline", "end", "invite", "signal", "e2ee"} {
 		r = append(r, route{"POST", "/v1/calls/:id/" + a, "call." + a, "call"})
 	}
@@ -79,7 +88,7 @@ func (s *Server) rest(r route) fh.HandlerFunc {
 		// fh reuses its read buffer once the handler returns, and a room outlives
 		// the request: everything kept is copied.
 		body := append([]byte(nil), c.Body()...)
-		if len(body) > maxBody {
+		if len(body) > s.ops[r.op].bodyLimit() {
 			return writeError(c, &apiError{413, "too_large", ""})
 		}
 		if c.Method() == "POST" && len(body) > 0 && !strings.HasPrefix(strings.ToLower(c.Get("Content-Type")), "application/json") {

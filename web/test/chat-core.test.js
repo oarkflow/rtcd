@@ -61,3 +61,67 @@ test('a conversation key is wrapped for one member and no one else', async () =>
   assert.equal(a, await C.safetyCode([bob.publicRaw, ada.publicRaw]));
   assert.notEqual(a, await C.safetyCode([ada.publicRaw, eve.publicRaw]));
 });
+
+// ---- epochs, identities, streaming files -----------------------------------
+
+test('an epoch key is bound to its conversation, its epoch and its recipient', async () => {
+  const ada = await C.newIdentity(), bob = await C.newIdentity(), eve = await C.newIdentity();
+  const key = C.newKey();
+  const w = await C.wrapEpochKey(ada.privateKey, ada.publicRaw, bob.publicRaw, 'grp_1', 3, key);
+  assert.ok(w.startsWith('k2.'));
+  assert.deepEqual(await C.unwrapEpochKey(bob.privateKey, bob.publicRaw, ada.publicRaw, 'grp_1', 3, w), key);
+  for (const [conv, epoch] of [['grp_2', 3], ['grp_1', 4]])
+    await assert.rejects(C.unwrapEpochKey(bob.privateKey, bob.publicRaw, ada.publicRaw, conv, epoch, w), { code: 'forged' });
+  await assert.rejects(C.unwrapEpochKey(eve.privateKey, eve.publicRaw, ada.publicRaw, 'grp_1', 3, w), { code: 'forged' }, 'another device');
+  await assert.rejects(C.unwrapEpochKey(bob.privateKey, bob.publicRaw, eve.publicRaw, 'grp_1', 3, w), { code: 'forged' }, 'claimed to be from someone else');
+});
+
+test('an identity survives being stored as text', async () => {
+  const ada = await C.newIdentity(), bob = await C.newIdentity();
+  const back = await C.importIdentity(await C.exportIdentity(bob));
+  const w = await C.wrapEpochKey(ada.privateKey, ada.publicRaw, bob.publicRaw, 'c', 1, C.newKey());
+  assert.equal((await C.unwrapEpochKey(back.privateKey, back.publicRaw, ada.publicRaw, 'c', 1, w)).length, 32);
+});
+
+test('the incremental SHA-256 agrees with the platform for every length that matters', async () => {
+  const nc = require('node:crypto');
+  for (const n of [0, 1, 55, 56, 57, 63, 64, 65, 119, 120, 121, 128, 1000, 70000]) {
+    const b = rnd(n), h = new C.Sha256();
+    for (let i = 0; i < n; i += 37) h.update(b.subarray(i, Math.min(n, i + 37)));
+    assert.equal(C.hex(h.digest()), nc.createHash('sha256').update(b).digest('hex'), 'length ' + n);
+  }
+});
+
+test('a file prepared a chunk at a time is the same bytes as one encrypted whole', async () => {
+  const data = rnd(C.CHUNK + 999);
+  const prep = await C.prepareFile('grp_1', new Blob([data]));
+  const parts = [];
+  for (let n = 0; n < prep.count; n++) parts.push(await prep.part(n));
+  const cipher = new Uint8Array(parts.reduce((a, p) => a + p.length, 0)); let o = 0; for (const p of parts) { cipher.set(p, o); o += p.length; }
+  assert.equal(prep.size, cipher.length);
+  assert.equal(prep.sha256, require('node:crypto').createHash('sha256').update(cipher).digest('hex'));
+  assert.equal(parts[0].length, prep.chunk);
+  assert.deepEqual(await C.decryptFile('grp_1', prep.meta, cipher), data);
+});
+
+test('what other implementations must open still opens', async () => {
+  const v = require('./vectors.json');
+  assert.equal(await C.decryptMessage(C.unb64(v.message.key), v.message, v.message.body), v.message.plaintext);
+  const { webcrypto } = require('node:crypto');
+  const priv = async (side) => webcrypto.subtle.importKey('jwk', { kty: 'EC', crv: 'P-256', d: side.d, x: C.b64(C.unb64(side.pub).slice(1, 33)), y: C.b64(C.unb64(side.pub).slice(33)) }, { name: 'ECDH', namedCurve: 'P-256' }, false, ['deriveBits']);
+  const got = await C.unwrapEpochKey(await priv(v.wrap.recipient), C.unb64(v.wrap.recipient.pub), C.unb64(v.wrap.sender.pub), v.wrap.conv, v.wrap.epoch, v.wrap.wrapped);
+  assert.equal(C.b64(got), v.wrap.key);
+  assert.equal(C.b64(await C.unwrapKey(await priv(v.wrap.recipient), C.unb64(v.wrap.recipient.pub), C.unb64(v.wrap.sender.pub), v.wrap.conv, v.wrap.legacy)), v.wrap.key);
+  assert.deepEqual(await C.decryptFile(v.file.conv, v.file.meta, C.unb64(v.file.cipher)), C.unb64(v.file.plain));
+  assert.equal(await C.safetyCode(v.safety.pubs.map(C.unb64)), v.safety.code);
+});
+
+test('what the Dart client made opens here', async () => {
+  const v = require('./vectors-dart.json');
+  assert.equal(await C.decryptMessage(C.unb64(v.message.key), v.message, v.message.body), v.message.plaintext);
+  const { webcrypto } = require('node:crypto');
+  const pub = C.unb64(v.wrap.recipient.pub);
+  const me = await webcrypto.subtle.importKey('jwk', { kty: 'EC', crv: 'P-256', d: v.wrap.recipient.d, x: C.b64(pub.slice(1, 33)), y: C.b64(pub.slice(33)) }, { name: 'ECDH', namedCurve: 'P-256' }, false, ['deriveBits']);
+  assert.equal(C.b64(await C.unwrapEpochKey(me, pub, C.unb64(v.wrap.sender.pub), v.wrap.conv, v.wrap.epoch, v.wrap.wrapped)), v.wrap.key);
+  assert.deepEqual(await C.decryptFile(v.file.conv, v.file.meta, C.unb64(v.file.cipher)), C.unb64(v.file.plain));
+});

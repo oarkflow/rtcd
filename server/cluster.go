@@ -384,7 +384,7 @@ func (c *cluster) poll(ctx context.Context) {
 		for _, u := range users {
 			_ = c.s.hubs.deliver(e.tenant, u, e.ev, json.RawMessage(e.data), e.from)
 		}
-		if strings.HasPrefix(e.ev, "group.") {
+		if strings.HasPrefix(e.ev, "group.") || strings.HasPrefix(e.ev, "conv.") {
 			c.s.dropConvs()
 		}
 	}

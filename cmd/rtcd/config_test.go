@@ -24,6 +24,10 @@ limits { shards 16  max_connections 5000  ops_per_second 150.5  ops_burst 300 }
 udp_port_min 50000
 udp_port_max 50100
 record_dir ".data/rec"
+message_delete_window "2m"
+max_devices_per_user 12
+max_conversation_members 800
+webhook { url "https://app.example.com/rtcd-hook"  secret "hook-secret-0123456789" }
 `
 
 func TestAConfigInBCLIsRead(t *testing.T) {
@@ -53,6 +57,9 @@ func TestAConfigInBCLIsRead(t *testing.T) {
 	}()
 	if cfg.MaxTokenTTL != 30*time.Minute || cfg.UDPPortMin != 50000 || cfg.UDPPortMax != 50100 || cfg.AuditDB == nil || cfg.AuditQueue != 4096 || cfg.MaxOwnedGroups != 50 || cfg.RecordDir != ".data/rec" {
 		t.Fatalf("%+v", cfg)
+	}
+	if cfg.DeleteWindow != 2*time.Minute || cfg.MaxDevices != 12 || cfg.MaxManagedMembers != 800 || cfg.WebhookURL != "https://app.example.com/rtcd-hook" || cfg.WebhookSecret != "hook-secret-0123456789" {
+		t.Fatalf("chat settings: %+v", cfg)
 	}
 	if len(cfg.Keys) != 2 || cfg.Keys[1].Name != "shop" || len(dbs) != 2 {
 		t.Fatalf("%+v %d", cfg.Keys, len(dbs))

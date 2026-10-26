@@ -54,9 +54,12 @@ The first event, `ready`, says who you are and when your token ends. Send `{"typ
 | `ice` | STUN/TURN servers with a short-lived TURN credential |
 | `auth.refresh {token}` | extend the connection with a new token for the same user |
 
-Service-key only: `token.mint {user, ttl_seconds, scopes[]}`, `audit.query`, `audit.verify`, `stats`.
+| `msg.*` · `file.*` | messages and attachments (below) |
+| `key.publish` · `key.revoke` · `key.list` · `epoch.get` · `epoch.missing` · `epoch.rotate` · `epoch.grant` | device keys and conversation key epochs ([docs/chat.md](docs/chat.md)) |
 
-Events: `call.incoming`, `call.answered`, `call.declined`, `call.left`, `call.invited`, `call.ended`, `call.signal`, `call.e2ee`, `sfu.offer`, `sfu.candidate`, `sfu.speaker`, `sfu.recording`, `group.added`, `group.removed`, `group.updated`, `group.members_added`, `group.members_removed`, `group.role`, `group.owner`, `group.deleted`.
+Service-key only: `token.mint {user, ttl_seconds, scopes[]}`, `audit.query`, `audit.verify`, `stats`, `room.*` (managed rooms), `conv.*` (managed conversations, [docs/chat.md](docs/chat.md)).
+
+Events: `call.incoming`, `call.answered`, `call.declined`, `call.left`, `call.invited`, `call.ended`, `call.signal`, `call.e2ee`, `sfu.offer`, `sfu.candidate`, `sfu.speaker`, `sfu.recording`, `group.added`, `group.removed`, `group.updated`, `group.members_added`, `group.members_removed`, `group.role`, `group.owner`, `group.deleted`, `msg.new`, `msg.read`, `msg.deleted`, `msg.typing`, `conv.added`, `conv.members`, `conv.removed`, `conv.closed`, `conv.rekey`, `epoch.new`, `epoch.granted`, `key.added`, `key.revoked`.
 
 ### HTTP
 
@@ -141,6 +144,11 @@ Run any number of rtcd nodes on one shared database and give each a `node_id` (`
 - **Files** need `attach_dir` on a volume every node mounts, or one node serving them.
 - The database must be shared: SQLite works only for nodes on one machine; use PostgreSQL or MySQL for nodes on different machines (see *Databases*).
 - Cross-node delivery costs up to ~200 ms plus a database write per event, so a single node (no `node_id`) is still the fastest setup.
+
+## Backends with their own membership (Aura-style)
+
+Managed conversations, a per-device key directory with key epochs, message lifetimes,
+per-conversation retention and a webhook for push: see **[docs/chat.md](docs/chat.md)**.
 
 ## Browser side: chat
 
@@ -242,6 +250,7 @@ udp_port_max 50100
 | `groups { max_owned max_members }` | |
 | `node_id` | names this node when several share a database |
 | `attach_dir`, `max_file_bytes`, `tenant_file_bytes`, `file_retention`, `message_retention`, `max_message_bytes` | messages and attachments |
+| `webhook { url secret }`, `max_devices_per_user`, `max_conversation_members`, `message_delete_window` | managed conversations, keys and the webhook ([docs/chat.md](docs/chat.md)) |
 | `record_min_free_bytes`, `record_max_duration` | recording safeguards |
 | `limits { conv_messages_per_second conv_message_burst }` | messages a conversation accepts per second in all (default 50, burst 100). A sender over it gets `rate_limited` and retries the same message; it keeps every member's queue (`writer_queue`, 256) from being overrun by a burst. Keep the burst below the queue |
 | `limits { shards max_connections max_connections_per_user writer_queue ops_per_second ops_burst relay_per_second relay_burst }` | |
@@ -282,7 +291,7 @@ Service-level: keys are compared in constant time over their hashes; tokens are 
 ## Not done yet
 
 - **SFU across nodes.** A room lives on one node (see *Several nodes*). The cascade exists in `sfu` and passes its tests in one process, but has no HTTP link between nodes.
-- Webhooks to the backend (it learns of events by holding a socket as a user).
+- Webhook delivery is in memory and at most once across a node restart (see [docs/chat.md](docs/chat.md)).
 - No per-tenant quotas, only per-user limits.
 - Safari and Firefox: the managed-room flow and encrypted group calls were run in Playwright's WebKit and Firefox (three browsers, key rotation on a leave, a removal) from the Aura repository's `web/e2e/sfu`, with fake cameras. That is the engines, not Safari itself, and not a phone.
 
@@ -290,5 +299,7 @@ Service-level: keys are compared in constant time over their hashes; tokens are 
 
 ```
 go test -race ./...                       # auth, calls, groups, audit, API (real HTTP and WebSocket), SFU with real Pion clients
-node --test web/test/e2ee-core.test.js    # the browser cryptography against real WebCrypto
+node --test web/test/*.test.js          # the browser cryptography against real WebCrypto; ChatClient against a real rtcd
+(cd clients/dart && dart test)            # the Dart client, including a conversation with a JavaScript peer
 ```
+The server suite runs on PostgreSQL and MySQL too (`RTCD_TEST_DB=postgres|mysql`, see *Databases*).
