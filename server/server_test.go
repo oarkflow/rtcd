@@ -7,7 +7,6 @@ import (
 	"errors"
 	"net"
 	"net/http"
-	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -40,18 +39,10 @@ func start(t *testing.T, tweak func(*server.Config)) *svc { return startTB(t, tw
 func startTB(t testing.TB, tweak func(*server.Config)) *svc {
 	t.Helper()
 	dir := t.TempDir()
-	open := func(name string, conns int) *sql.DB {
-		db, err := sql.Open("sqlite", "file:"+filepath.Join(dir, name)+"?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)")
-		if err != nil {
-			t.Fatal(err)
-		}
-		db.SetMaxOpenConns(conns)
-		t.Cleanup(func() { db.Close() })
-		return db
-	}
+	open := func(name string, conns int) *sql.DB { return testDB(t, dir, name, conns) }
 	adb := open("a.db", 1)
 	cfg := server.Config{
-		DB: open("r.db", 1), AuditDB: adb, Dialect: "sqlite", TokenSecret: "token-secret-token-secret-0123456",
+		DB: open("r.db", 1), AuditDB: adb, Dialect: dialect(), TokenSecret: "token-secret-token-secret-0123456",
 		Keys:           []auth.ServiceKey{{Name: "chat", Key: acmeKey, Tenant: "acme"}, {Name: "shop", Key: zetaKey, Tenant: "zeta"}},
 		AllowedOrigins: []string{origin},
 		RecordDir:      t.TempDir(),

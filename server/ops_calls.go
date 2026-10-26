@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"strings"
 
 	"github.com/oarkflow/rtcd/auth"
 	"github.com/oarkflow/rtcd/calls"
@@ -171,5 +172,9 @@ func (s *Server) registerCalls() {
 
 // Notify implements calls.Notifier and groups.Notifier.
 func (s *Server) Notify(_ context.Context, tenant, user, event string, data json.RawMessage, from string) error {
+	if strings.HasPrefix(event, "group.") {
+		s.dropConvs() // membership may have changed: the next message checks again
+	}
+	s.publish(tenant, user, event, data, from)
 	return s.hubs.deliver(tenant, user, event, data, from)
 }

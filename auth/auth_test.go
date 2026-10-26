@@ -158,7 +158,7 @@ func TestTokenScopesAreSignedAndLimitWhatATokenMayDo(t *testing.T) {
 	if svc.Scopes != UserScopes || !svc.Expires.IsZero() {
 		t.Fatalf("%+v", svc)
 	}
-	if sc, err := ParseScopes([]string{"calls", "groups"}); err != nil || sc != UserScopes {
+	if sc, err := ParseScopes([]string{"calls", "groups", "chat"}); err != nil || sc != UserScopes {
 		t.Fatalf("%v %v", sc, err)
 	}
 	if sc, _ := ParseScopes(nil); sc != UserScopes {
@@ -166,5 +166,25 @@ func TestTokenScopesAreSignedAndLimitWhatATokenMayDo(t *testing.T) {
 	}
 	if _, err := ParseScopes([]string{"admin"}); err == nil {
 		t.Fatal("an unknown scope was accepted")
+	}
+}
+
+func TestRevokeRefusesEarlierTokensAndNotLaterOnes(t *testing.T) {
+	now := time.Now()
+	a, _ := New([]ServiceKey{{Name: "chat", Key: "chat-service-key-0123456789", Tenant: "acme"}}, "secret-secret-secret-secret-1", func() time.Time { return now })
+	old, _, _ := a.Mint("acme", "ada", time.Hour, UserScopes)
+	other, _, _ := a.Mint("acme", "bob", time.Hour, UserScopes)
+	now = now.Add(time.Second)
+	a.Revoke("acme", "ada")
+	if _, err := a.Authenticate(old); err == nil {
+		t.Fatal("a revoked user's token still works")
+	}
+	if _, err := a.Authenticate(other); err != nil {
+		t.Fatal("revoking one user cut off another")
+	}
+	now = now.Add(time.Second)
+	fresh, _, _ := a.Mint("acme", "ada", time.Hour, UserScopes)
+	if _, err := a.Authenticate(fresh); err != nil {
+		t.Fatal("a token minted after the revocation was refused")
 	}
 }

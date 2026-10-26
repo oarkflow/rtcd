@@ -14,6 +14,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/oarkflow/rtcd/dbx"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -117,7 +118,7 @@ func Open(ctx context.Context, db *sql.DB, o Options) (*Store, error) {
 		`CREATE INDEX IF NOT EXISTS rtc_group_members_user ON rtc_group_members (user_id)`,
 		`CREATE INDEX IF NOT EXISTS rtc_groups_owner ON rtc_groups (tenant, owner)`,
 	} {
-		if _, err := db.ExecContext(ctx, q); err != nil {
+		if err := dbx.DDL(ctx, db, o.Dialect, q); err != nil {
 			return nil, fmt.Errorf("groups: schema: %w", err)
 		}
 	}
@@ -589,4 +590,24 @@ func (s *Store) Delete(ctx context.Context, by Actor, id string) error {
 	}
 	s.tell(ctx, by.Tenant, userNames(g.Members), "group.deleted", map[string]any{"group": id, "name": g.Name, "by": by.ID}, by.ID)
 	return nil
+}
+
+// Roster returns who is in a group of the tenant and in what role, in one query.
+// It checks nothing about the caller: the server uses it to decide for itself.
+// A group that does not exist has an empty roster.
+func (s *Store) Roster(ctx context.Context, tenant, id string) ([]Member, error) {
+	rows, err := s.db.QueryContext(ctx, s.rebind(`SELECT m.user_id, m.role FROM rtc_group_members m JOIN rtc_groups g ON g.id = m.group_id WHERE g.id = $1 AND g.tenant = $2`), id, tenant)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []Member
+	for rows.Next() {
+		var m Member
+		if err := rows.Scan(&m.User, &m.Role); err != nil {
+			return nil, err
+		}
+		out = append(out, m)
+	}
+	return out, rows.Err()
 }

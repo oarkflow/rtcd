@@ -16,6 +16,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 	"unicode/utf8"
 )
@@ -42,8 +43,9 @@ type Scopes uint8
 const (
 	ScopeCalls  Scopes = 1 << iota // calls and group-call media signaling
 	ScopeGroups                    // creating and managing groups
+	ScopeChat                      // messages and attachments
 	// UserScopes is what a token carries when none are asked for.
-	UserScopes = ScopeCalls | ScopeGroups
+	UserScopes = ScopeCalls | ScopeGroups | ScopeChat
 )
 
 // ParseScopes turns names into Scopes. No names means UserScopes.
@@ -58,6 +60,8 @@ func ParseScopes(names []string) (Scopes, error) {
 			sc |= ScopeCalls
 		case "groups":
 			sc |= ScopeGroups
+		case "chat":
+			sc |= ScopeChat
 		default:
 			return 0, fmt.Errorf("auth: unknown scope %q", n)
 		}
@@ -73,6 +77,9 @@ func (s Scopes) Names() []string {
 	}
 	if s&ScopeGroups != 0 {
 		out = append(out, "groups")
+	}
+	if s&ScopeChat != 0 {
+		out = append(out, "chat")
 	}
 	return out
 }
@@ -95,6 +102,10 @@ type Authenticator struct {
 	keys   []keyEntry
 	secret []byte
 	now    func() time.Time
+
+	rmu     sync.Mutex
+	revoked map[string]int64 // tenant\x00user -> unix ns: tokens issued at or before this are refused
+	retain  time.Duration
 }
 
 type keyEntry struct {
@@ -110,7 +121,7 @@ func New(keys []ServiceKey, tokenSecret string, now func() time.Time) (*Authenti
 	if now == nil {
 		now = time.Now
 	}
-	a := &Authenticator{secret: []byte(tokenSecret), now: now}
+	a := &Authenticator{secret: []byte(tokenSecret), now: now, revoked: map[string]int64{}, retain: 24 * time.Hour}
 	seenKey, seenName := map[string]bool{}, map[string]bool{}
 	for _, k := range keys {
 		switch {
@@ -192,6 +203,7 @@ type claims struct {
 	Tenant  string `json:"t"`
 	User    string `json:"u"`
 	Expires int64  `json:"e"`
+	Issued  int64  `json:"i,omitempty"` // unix nanoseconds; lets a revocation cut off older tokens
 	Scopes  Scopes `json:"s"`
 }
 
@@ -204,7 +216,7 @@ func (a *Authenticator) Mint(tenant, user string, ttl time.Duration, scopes Scop
 		return "", time.Time{}, errors.New("auth: a token needs at least one valid scope")
 	}
 	exp := a.now().Add(ttl)
-	body, _ := json.Marshal(claims{tenant, user, exp.Unix(), scopes})
+	body, _ := json.Marshal(claims{Tenant: tenant, User: user, Expires: exp.Unix(), Issued: a.now().UnixNano(), Scopes: scopes})
 	payload := base64.RawURLEncoding.EncodeToString(body)
 	return tokenPrefix + payload + "." + a.sign(payload), exp, nil
 }
@@ -235,5 +247,56 @@ func (a *Authenticator) verify(token string) (Principal, error) {
 	if c.Scopes == 0 || c.Scopes&^UserScopes != 0 {
 		return Principal{}, ErrUnauthenticated
 	}
+	if a.isRevoked(c.Tenant, c.User, c.Issued) {
+		return Principal{}, ErrUnauthenticated
+	}
 	return Principal{Tenant: c.Tenant, User: c.User, Scopes: c.Scopes, Expires: time.Unix(c.Expires, 0)}, nil
+}
+
+// SetRetention is how long a revocation is remembered: it must be at least the
+// longest life a token can have, after which no older token can still be valid.
+func (a *Authenticator) SetRetention(d time.Duration) {
+	if d > 0 {
+		a.rmu.Lock()
+		a.retain = d
+		a.rmu.Unlock()
+	}
+}
+
+// Revoke refuses every token already minted for the user (tokens minted after
+// this call work). It is held in memory: a restart forgets it, but tokens are
+// short-lived, and a node that has not seen the revocation is why a multi-node
+// deployment must send it to every node.
+func (a *Authenticator) Revoke(tenant, user string) int64 {
+	now := a.now().UnixNano()
+	a.rmu.Lock()
+	defer a.rmu.Unlock()
+	for k, at := range a.revoked {
+		if now-at > a.retain.Nanoseconds() {
+			delete(a.revoked, k)
+		}
+	}
+	a.revoked[tenant+"\x00"+user] = now
+	return now
+}
+
+// RevokeAt applies a revocation made elsewhere (another node, an earlier run).
+func (a *Authenticator) RevokeAt(tenant, user string, at int64) {
+	a.rmu.Lock()
+	defer a.rmu.Unlock()
+	if k := tenant + "\x00" + user; a.revoked[k] < at {
+		a.revoked[k] = at
+	}
+}
+
+// Revoked reports whether tokens for the user issued at or before issued (unix ns) are refused.
+func (a *Authenticator) Revoked(tenant, user string, issued int64) bool {
+	return a.isRevoked(tenant, user, issued)
+}
+
+func (a *Authenticator) isRevoked(tenant, user string, issued int64) bool {
+	a.rmu.Lock()
+	at, ok := a.revoked[tenant+"\x00"+user]
+	a.rmu.Unlock()
+	return ok && issued <= at
 }

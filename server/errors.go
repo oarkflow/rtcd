@@ -6,6 +6,7 @@ import (
 
 	"github.com/oarkflow/rtcd/audit"
 	"github.com/oarkflow/rtcd/calls"
+	"github.com/oarkflow/rtcd/chat"
 	"github.com/oarkflow/rtcd/groups"
 	"github.com/oarkflow/rtcd/sfu"
 )
@@ -33,6 +34,16 @@ func classify(err error) (status int, code, msg string) {
 		return ae.Status, ae.Code, ae.Message
 	case errors.Is(err, calls.ErrForbidden), errors.Is(err, groups.ErrForbidden):
 		return 403, "forbidden", ""
+	case errors.Is(err, chat.ErrNotFound):
+		return 404, "not_found", ""
+	case errors.Is(err, chat.ErrForbidden):
+		return 403, "forbidden", ""
+	case errors.Is(err, chat.ErrInvalid):
+		return 400, "invalid", err.Error()
+	case errors.Is(err, chat.ErrLimit):
+		return 429, "limit_reached", err.Error()
+	case errors.Is(err, chat.ErrState):
+		return 409, "wrong_state", ""
 	case errors.Is(err, calls.ErrNotFound):
 		return 404, "not_found", ""
 	case errors.Is(err, calls.ErrInvalid), errors.Is(err, groups.ErrInvalid):
@@ -53,6 +64,8 @@ func classify(err error) (status int, code, msg string) {
 		return 400, "bad_preferences", ""
 	case errors.Is(err, sfu.ErrRecordingDisabled):
 		return 404, "recording_disabled", ""
+	case errors.Is(err, sfu.ErrDiskFull):
+		return 507, "disk_full", ""
 	case errors.Is(err, sfu.ErrRecording):
 		return 409, "already_recording", ""
 	case errors.Is(err, sfu.ErrNotRecording):

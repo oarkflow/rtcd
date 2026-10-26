@@ -1,0 +1,528 @@
+// Package chat stores messages and the metadata of attachments.
+//
+// The service never reads either. A message body is an opaque string the
+// sender's client encrypted (the server stores and forwards it); an attachment
+// is a ciphertext blob, and the key to it travels inside an encrypted message.
+// What the server can enforce is who may send and fetch, sizes, rates and
+// retention.
+package chat
+
+import (
+	"context"
+	"crypto/rand"
+	"database/sql"
+	"encoding/hex"
+	"errors"
+	"fmt"
+	"github.com/oarkflow/rtcd/dbx"
+	"strings"
+	"sync"
+	"time"
+)
+
+var (
+	ErrInvalid   = errors.New("chat: invalid request")
+	ErrNotFound  = errors.New("chat: not found")
+	ErrForbidden = errors.New("chat: forbidden")
+	ErrLimit     = errors.New("chat: limit reached")
+	ErrState     = errors.New("chat: wrong state")
+)
+
+// Message is one stored message.
+type Message struct {
+	Conv    string    `json:"conv"`
+	Seq     int64     `json:"seq"`
+	ID      string    `json:"id"` // the sender's id for it, unique per sender and conversation
+	Sender  string    `json:"sender"`
+	Sent    time.Time `json:"sent_at"`
+	Body    string    `json:"body,omitempty"`
+	Deleted bool      `json:"deleted,omitempty"`
+}
+
+// Options configure a Store.
+type Options struct {
+	Dialect string
+	Rebind  func(string) string
+	// MaxBody is the largest message body in bytes. Default 32 KiB.
+	MaxBody int
+	Now     func() time.Time
+}
+
+// Store keeps messages in SQL.
+type Store struct {
+	db       *sql.DB
+	o        Options
+	rebind   func(string) string
+	locks    [64]sync.Mutex
+	cmu      sync.Mutex
+	qmu      sync.Mutex
+	queues   map[string]*convQueue
+	counters map[string]int64 // conversation -> newest number this node wrote
+}
+
+// Open prepares the schema.
+func Open(ctx context.Context, db *sql.DB, o Options) (*Store, error) {
+	if o.Now == nil {
+		o.Now = func() time.Time { return time.Now().UTC() }
+	}
+	if o.MaxBody <= 0 {
+		o.MaxBody = 32 << 10
+	}
+	s := &Store{db: db, o: o, rebind: o.Rebind, counters: map[string]int64{}, queues: map[string]*convQueue{}}
+	if s.rebind == nil {
+		s.rebind = func(q string) string { return q }
+	}
+	key := "VARCHAR(191)"
+	for _, q := range []string{
+		`CREATE TABLE IF NOT EXISTS rtc_messages (tenant ` + key + ` NOT NULL, conv ` + key + ` NOT NULL, seq BIGINT NOT NULL,
+			id ` + key + ` NOT NULL, sender ` + key + ` NOT NULL, sent_at BIGINT NOT NULL, body TEXT NOT NULL, deleted INTEGER NOT NULL DEFAULT 0,
+			PRIMARY KEY (tenant, conv, seq))`,
+		`CREATE UNIQUE INDEX IF NOT EXISTS rtc_messages_idem ON rtc_messages (tenant, conv, sender, id)`,
+		`CREATE INDEX IF NOT EXISTS rtc_messages_age ON rtc_messages (sent_at)`,
+		`CREATE TABLE IF NOT EXISTS rtc_msg_cursor (tenant ` + key + ` NOT NULL, conv ` + key + ` NOT NULL, user_id ` + key + ` NOT NULL,
+			seq BIGINT NOT NULL, PRIMARY KEY (tenant, conv, user_id))`,
+		`CREATE TABLE IF NOT EXISTS rtc_files (id ` + key + ` PRIMARY KEY, tenant ` + key + ` NOT NULL, conv ` + key + ` NOT NULL,
+			owner ` + key + ` NOT NULL, size BIGINT NOT NULL, chunk BIGINT NOT NULL, sha256 ` + key + ` NOT NULL, state VARCHAR(16) NOT NULL,
+			created_at BIGINT NOT NULL, expires_at BIGINT NOT NULL)`,
+		`CREATE INDEX IF NOT EXISTS rtc_files_conv ON rtc_files (tenant, conv)`,
+		`CREATE INDEX IF NOT EXISTS rtc_files_exp ON rtc_files (expires_at)`,
+	} {
+		if err := dbx.DDL(ctx, db, o.Dialect, q); err != nil {
+			return nil, fmt.Errorf("chat: schema: %w", err)
+		}
+	}
+	return s, nil
+}
+
+func (s *Store) lock(tenant, conv string) *sync.Mutex {
+	h := uint32(2166136261)
+	for _, c := range []byte(tenant + "\x00" + conv) {
+		h = (h ^ uint32(c)) * 16777619
+	}
+	return &s.locks[h%uint32(len(s.locks))]
+}
+
+// sendOne stores one message and gives it the next number in its conversation. A
+// retry with the same id from the same sender returns the message already stored
+// (dup is true), so a client can resend after a dropped connection safely.
+//
+// In the usual case this is one INSERT and nothing else: the next number comes
+// from a counter held in memory under the conversation's lock. If another node
+// has written to the conversation, the INSERT collides on the primary key, the
+// counter is reloaded, and it is tried again.
+func (s *Store) sendOne(ctx context.Context, tenant, conv, sender, id, body string) (m Message, dup bool, err error) {
+	if tenant == "" || conv == "" || sender == "" || id == "" || len(id) > 64 || body == "" || len(body) > s.o.MaxBody {
+		return Message{}, false, ErrInvalid
+	}
+	key := tenant + "\x00" + conv
+	mu := s.lock(tenant, conv)
+	mu.Lock()
+	defer mu.Unlock()
+	now := s.o.Now().UTC()
+	at := now.UnixMilli()
+	for try := 0; try < 6; try++ {
+		s.cmu.Lock()
+		seq, ok := s.counters[key]
+		s.cmu.Unlock()
+		if !ok {
+			var max sql.NullInt64
+			if err := s.db.QueryRowContext(ctx, s.rebind(`SELECT MAX(seq) FROM rtc_messages WHERE tenant=$1 AND conv=$2`), tenant, conv).Scan(&max); err != nil {
+				return Message{}, false, err
+			}
+			seq = max.Int64
+		}
+		seq++
+		_, err = s.db.ExecContext(ctx, s.rebind(`INSERT INTO rtc_messages (tenant, conv, seq, id, sender, sent_at, body) VALUES ($1,$2,$3,$4,$5,$6,$7)`),
+			tenant, conv, seq, id, sender, at, body)
+		if err == nil {
+			s.setCounter(key, seq)
+			return Message{Conv: conv, Seq: seq, ID: id, Sender: sender, Sent: time.UnixMilli(at).UTC(), Body: body}, false, nil
+		}
+		if !dbx.IsDuplicate(err) && !dbx.IsRetryable(err) {
+			return Message{}, false, err
+		}
+		// Either this id was sent before (return it), or the number was taken by
+		// another node (forget the counter and try the next one).
+		var oseq, oat int64
+		switch e := s.db.QueryRowContext(ctx, s.rebind(`SELECT seq, sent_at FROM rtc_messages WHERE tenant=$1 AND conv=$2 AND sender=$3 AND id=$4`), tenant, conv, sender, id).Scan(&oseq, &oat); {
+		case e == nil:
+			return Message{Conv: conv, Seq: oseq, ID: id, Sender: sender, Sent: time.UnixMilli(oat).UTC()}, true, nil
+		case !errors.Is(e, sql.ErrNoRows):
+			return Message{}, false, e
+		}
+		s.dropCounter(key)
+	}
+	return Message{}, false, err
+}
+
+func (s *Store) setCounter(key string, seq int64) {
+	s.cmu.Lock()
+	if len(s.counters) > 50000 {
+		s.counters = map[string]int64{}
+	}
+	s.counters[key] = seq
+	s.cmu.Unlock()
+}
+
+func (s *Store) dropCounter(key string) {
+	s.cmu.Lock()
+	delete(s.counters, key)
+	s.cmu.Unlock()
+}
+
+// History returns up to limit messages: those after `after` (oldest first), or,
+// when before is set, those before it (newest first).
+func (s *Store) History(ctx context.Context, tenant, conv string, after, before int64, limit int) ([]Message, error) {
+	if limit <= 0 || limit > 100 {
+		limit = 50
+	}
+	q := `SELECT seq, id, sender, sent_at, body, deleted FROM rtc_messages WHERE tenant=$1 AND conv=$2 AND seq>$3 `
+	args := []any{tenant, conv, after}
+	order := " ORDER BY seq ASC"
+	if before > 0 {
+		q += "AND seq<$4 "
+		args = append(args, before)
+		order = " ORDER BY seq DESC"
+	}
+	rows, err := s.db.QueryContext(ctx, s.rebind(q+order+fmt.Sprintf(" LIMIT %d", limit)), args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []Message{}
+	for rows.Next() {
+		var m Message
+		var at int64
+		var del int
+		if err := rows.Scan(&m.Seq, &m.ID, &m.Sender, &at, &m.Body, &del); err != nil {
+			return nil, err
+		}
+		m.Conv, m.Sent, m.Deleted = conv, time.UnixMilli(at).UTC(), del != 0
+		out = append(out, m)
+	}
+	return out, rows.Err()
+}
+
+// Delete blanks a message (the number stays, so history has no gap). byAdmin
+// lets someone other than the sender do it.
+func (s *Store) Delete(ctx context.Context, tenant, conv string, seq int64, by string, byAdmin bool) error {
+	var sender string
+	err := s.db.QueryRowContext(ctx, s.rebind(`SELECT sender FROM rtc_messages WHERE tenant=$1 AND conv=$2 AND seq=$3`), tenant, conv, seq).Scan(&sender)
+	if errors.Is(err, sql.ErrNoRows) {
+		return ErrNotFound
+	} else if err != nil {
+		return err
+	}
+	if sender != by && !byAdmin {
+		return ErrForbidden
+	}
+	_, err = s.db.ExecContext(ctx, s.rebind(`UPDATE rtc_messages SET body='-', deleted=1 WHERE tenant=$1 AND conv=$2 AND seq=$3`), tenant, conv, seq)
+	return err
+}
+
+// MarkRead moves a user's read position forward (never back).
+func (s *Store) MarkRead(ctx context.Context, tenant, conv, user string, seq int64) (int64, error) {
+	var cur int64
+	err := s.db.QueryRowContext(ctx, s.rebind(`SELECT seq FROM rtc_msg_cursor WHERE tenant=$1 AND conv=$2 AND user_id=$3`), tenant, conv, user).Scan(&cur)
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+		_, err = s.db.ExecContext(ctx, s.rebind(`INSERT INTO rtc_msg_cursor (tenant, conv, user_id, seq) VALUES ($1,$2,$3,$4)`), tenant, conv, user, seq)
+		return seq, err
+	case err != nil:
+		return 0, err
+	case seq <= cur:
+		return cur, nil
+	}
+	_, err = s.db.ExecContext(ctx, s.rebind(`UPDATE rtc_msg_cursor SET seq=$1 WHERE tenant=$2 AND conv=$3 AND user_id=$4`), seq, tenant, conv, user)
+	return seq, err
+}
+
+// Prune deletes messages older than keep, and returns how many.
+func (s *Store) Prune(ctx context.Context, keep time.Duration) (int64, error) {
+	if keep <= 0 {
+		return 0, nil
+	}
+	r, err := s.db.ExecContext(ctx, s.rebind(`DELETE FROM rtc_messages WHERE sent_at<$1`), s.o.Now().Add(-keep).UnixMilli())
+	if err != nil {
+		return 0, err
+	}
+	return r.RowsAffected()
+}
+
+// ---------------------------------------------------------------------------
+// Attachments.
+// ---------------------------------------------------------------------------
+
+// File states.
+const (
+	Uploading = "uploading"
+	Ready     = "ready"
+)
+
+// File describes one attachment.
+type File struct {
+	ID      string    `json:"id"`
+	Conv    string    `json:"conv"`
+	Owner   string    `json:"owner"`
+	Size    int64     `json:"size"`
+	Chunk   int64     `json:"chunk"`
+	SHA256  string    `json:"sha256"` // of the stored (encrypted) bytes
+	State   string    `json:"state"`
+	Created time.Time `json:"created_at"`
+	Expires time.Time `json:"expires_at"`
+}
+
+// Chunks is how many parts the file has.
+func (f File) Chunks() int64 { return (f.Size + f.Chunk - 1) / f.Chunk }
+
+func newFileID() string {
+	b := make([]byte, 16)
+	_, _ = rand.Read(b)
+	return "fil_" + hex.EncodeToString(b)
+}
+
+// ValidSHA reports whether s is a lowercase hex SHA-256.
+func ValidSHA(s string) bool {
+	if len(s) != 64 {
+		return false
+	}
+	for _, c := range s {
+		if !strings.ContainsRune("0123456789abcdef", c) {
+			return false
+		}
+	}
+	return true
+}
+
+// Quota bounds what a user and a tenant may hold.
+type Quota struct {
+	MaxFile        int64 // bytes in one file
+	PendingPerUser int   // uploads under way
+	TenantBytes    int64 // bytes the tenant holds in total (0: no limit)
+}
+
+// NewFile registers an upload.
+func (s *Store) NewFile(ctx context.Context, tenant, conv, owner string, size, chunk int64, sha string, ttl time.Duration, q Quota) (File, error) {
+	if size <= 0 || chunk <= 0 || !ValidSHA(sha) || size > q.MaxFile {
+		return File{}, ErrInvalid
+	}
+	var pending int
+	if err := s.db.QueryRowContext(ctx, s.rebind(`SELECT COUNT(*) FROM rtc_files WHERE tenant=$1 AND owner=$2 AND state=$3`), tenant, owner, Uploading).Scan(&pending); err != nil {
+		return File{}, err
+	}
+	if q.PendingPerUser > 0 && pending >= q.PendingPerUser {
+		return File{}, fmt.Errorf("%w: too many uploads under way", ErrLimit)
+	}
+	if q.TenantBytes > 0 {
+		var used sql.NullInt64
+		if err := s.db.QueryRowContext(ctx, s.rebind(`SELECT SUM(size) FROM rtc_files WHERE tenant=$1`), tenant).Scan(&used); err != nil {
+			return File{}, err
+		}
+		if used.Int64+size > q.TenantBytes {
+			return File{}, fmt.Errorf("%w: the tenant's storage is full", ErrLimit)
+		}
+	}
+	now := s.o.Now().UTC()
+	f := File{ID: newFileID(), Conv: conv, Owner: owner, Size: size, Chunk: chunk, SHA256: sha, State: Uploading, Created: now, Expires: now.Add(ttl)}
+	_, err := s.db.ExecContext(ctx, s.rebind(`INSERT INTO rtc_files (id, tenant, conv, owner, size, chunk, sha256, state, created_at, expires_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`),
+		f.ID, tenant, conv, owner, size, chunk, sha, Uploading, now.UnixMilli(), f.Expires.UnixMilli())
+	return f, err
+}
+
+// File returns an attachment of the tenant.
+func (s *Store) File(ctx context.Context, tenant, id string) (File, error) {
+	var f File
+	var c, e int64
+	err := s.db.QueryRowContext(ctx, s.rebind(`SELECT id, conv, owner, size, chunk, sha256, state, created_at, expires_at FROM rtc_files WHERE tenant=$1 AND id=$2`), tenant, id).
+		Scan(&f.ID, &f.Conv, &f.Owner, &f.Size, &f.Chunk, &f.SHA256, &f.State, &c, &e)
+	if errors.Is(err, sql.ErrNoRows) {
+		return File{}, ErrNotFound
+	}
+	f.Created, f.Expires = time.UnixMilli(c).UTC(), time.UnixMilli(e).UTC()
+	return f, err
+}
+
+// SetReady marks an upload complete, and extends its life to keep.
+func (s *Store) SetReady(ctx context.Context, tenant, id string, keep time.Duration) error {
+	r, err := s.db.ExecContext(ctx, s.rebind(`UPDATE rtc_files SET state=$1, expires_at=$2 WHERE tenant=$3 AND id=$4 AND state=$5`),
+		Ready, s.o.Now().Add(keep).UnixMilli(), tenant, id, Uploading)
+	if err != nil {
+		return err
+	}
+	if n, _ := r.RowsAffected(); n == 0 {
+		return ErrState
+	}
+	return nil
+}
+
+// DeleteFile removes the record.
+func (s *Store) DeleteFile(ctx context.Context, tenant, id string) error {
+	_, err := s.db.ExecContext(ctx, s.rebind(`DELETE FROM rtc_files WHERE tenant=$1 AND id=$2`), tenant, id)
+	return err
+}
+
+// Expired returns files past their time (tenant, id), for the caller to remove from disk.
+func (s *Store) Expired(ctx context.Context, limit int) ([][2]string, error) {
+	rows, err := s.db.QueryContext(ctx, s.rebind(`SELECT tenant, id FROM rtc_files WHERE expires_at<$1 LIMIT $2`), s.o.Now().UnixMilli(), limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out [][2]string
+	for rows.Next() {
+		var p [2]string
+		if err := rows.Scan(&p[0], &p[1]); err != nil {
+			return nil, err
+		}
+		out = append(out, p)
+	}
+	return out, rows.Err()
+}
+
+// ---------------------------------------------------------------------------
+// Group commit.
+// ---------------------------------------------------------------------------
+
+// Messages are numbered in order within a conversation, so a conversation's
+// writes cannot overlap. What can be shared is the round trip: while one write
+// is on its way, the messages that arrive for the same conversation wait, and
+// the next write carries all of them in one INSERT. Under load, a hundred
+// people talking at once cost a few statements, not a hundred.
+const maxBatch = 100
+
+type pending struct {
+	sender, id, body string
+	res              chan sendResult
+}
+
+type sendResult struct {
+	m   Message
+	dup bool
+	err error
+}
+
+type convQueue struct {
+	q       []*pending
+	running bool
+}
+
+// Send stores a message and gives it the next number in its conversation. A
+// retry with the same id from the same sender returns the message already stored
+// (dup is true), so a client can resend after a dropped connection safely.
+func (s *Store) Send(ctx context.Context, tenant, conv, sender, id, body string) (Message, bool, error) {
+	if tenant == "" || conv == "" || sender == "" || id == "" || len(id) > 64 || body == "" || len(body) > s.o.MaxBody {
+		return Message{}, false, ErrInvalid
+	}
+	key := tenant + "\x00" + conv
+	p := &pending{sender: sender, id: id, body: body, res: make(chan sendResult, 1)}
+	s.qmu.Lock()
+	cq := s.queues[key]
+	if cq == nil {
+		cq = &convQueue{}
+		s.queues[key] = cq
+	}
+	cq.q = append(cq.q, p)
+	start := !cq.running
+	cq.running = true
+	s.qmu.Unlock()
+	if start {
+		go s.drain(tenant, conv, key, cq)
+	}
+	select {
+	case r := <-p.res:
+		return r.m, r.dup, r.err
+	case <-ctx.Done():
+		return Message{}, false, ctx.Err() // the write may still happen; a retry with the same id finds it
+	}
+}
+
+func (s *Store) drain(tenant, conv, key string, cq *convQueue) {
+	for {
+		s.qmu.Lock()
+		batch := cq.q
+		if len(batch) > maxBatch {
+			batch = batch[:maxBatch]
+		}
+		cq.q = cq.q[len(batch):]
+		if len(batch) == 0 {
+			cq.running = false
+			delete(s.queues, key)
+			s.qmu.Unlock()
+			return
+		}
+		s.qmu.Unlock()
+		s.commit(tenant, conv, key, batch)
+	}
+}
+
+func (s *Store) commit(tenant, conv, key string, batch []*pending) {
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	one := func(p *pending) {
+		m, dup, err := s.sendOne(ctx, tenant, conv, p.sender, p.id, p.body)
+		p.res <- sendResult{m, dup, err}
+	}
+	if len(batch) == 1 {
+		one(batch[0])
+		return
+	}
+	// The same sender and id twice in one batch is a retry: the second waits for the first.
+	seen := map[string]bool{}
+	var fresh, later []*pending
+	for _, p := range batch {
+		k := p.sender + "\x00" + p.id
+		if seen[k] {
+			later = append(later, p)
+			continue
+		}
+		seen[k] = true
+		fresh = append(fresh, p)
+	}
+	mu := s.lock(tenant, conv)
+	mu.Lock()
+	s.cmu.Lock()
+	seq, ok := s.counters[key]
+	s.cmu.Unlock()
+	if !ok {
+		var max sql.NullInt64
+		if err := s.db.QueryRowContext(ctx, s.rebind(`SELECT MAX(seq) FROM rtc_messages WHERE tenant=$1 AND conv=$2`), tenant, conv).Scan(&max); err != nil {
+			mu.Unlock()
+			for _, p := range batch {
+				p.res <- sendResult{err: err}
+			}
+			return
+		}
+		seq = max.Int64
+	}
+	at := s.o.Now().UTC().UnixMilli()
+	var sb strings.Builder
+	sb.WriteString(`INSERT INTO rtc_messages (tenant, conv, seq, id, sender, sent_at, body) VALUES `)
+	args := make([]any, 0, len(fresh)*7)
+	for i, p := range fresh {
+		if i > 0 {
+			sb.WriteByte(',')
+		}
+		b := len(args)
+		fmt.Fprintf(&sb, "($%d,$%d,$%d,$%d,$%d,$%d,$%d)", b+1, b+2, b+3, b+4, b+5, b+6, b+7)
+		args = append(args, tenant, conv, seq+int64(i)+1, p.id, p.sender, at, p.body)
+	}
+	_, err := s.db.ExecContext(ctx, s.rebind(sb.String()), args...)
+	if err == nil {
+		s.setCounter(key, seq+int64(len(fresh)))
+	}
+	mu.Unlock()
+	if err != nil {
+		// A repeated id, or a number another node took: the one-at-a-time path sorts out which.
+		s.dropCounter(key)
+		for _, p := range fresh {
+			one(p)
+		}
+	} else {
+		for i, p := range fresh {
+			p.res <- sendResult{m: Message{Conv: conv, Seq: seq + int64(i) + 1, ID: p.id, Sender: p.sender, Sent: time.UnixMilli(at).UTC(), Body: p.body}}
+		}
+	}
+	for _, p := range later { // retries within the batch
+		one(p)
+	}
+}

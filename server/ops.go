@@ -151,6 +151,17 @@ func (o *opCtx) relayAllowed(call string) error {
 
 // auditOp records an operation and its outcome.
 func (s *Server) auditOp(o *opCtx, name string, err error, at time.Time) {
+	if err != nil {
+		if _, code, _ := classify(err); code == "rate_limited" {
+			// A client told to slow down and retrying would otherwise write an entry
+			// per retry and fill the log (and stall everyone behind it). The refusals
+			// are counted and written as one entry per user and operation every few
+			// seconds.
+			if !s.limited.note(o.sess.who.Tenant, o.sess.who.ID, o.sess.service, name, o.sess.ip, o.sess.transport) {
+				return // not the first since the last flush: counted, written with the next summary
+			}
+		}
+	}
 	e := audit.Event{Tenant: o.sess.who.Tenant, Time: at, Actor: o.sess.who.ID, Service: o.sess.service, Action: name,
 		Target: o.target, Outcome: audit.OK, IP: o.sess.ip, Transport: o.sess.transport, Conn: o.sess.conn, Meta: o.meta}
 	if err != nil {
@@ -182,4 +193,50 @@ func (s *Server) auditAnon(action, code, ip, transport string) {
 
 func contextWithTimeout(parent context.Context, d time.Duration) (context.Context, context.CancelFunc) {
 	return context.WithTimeout(parent, d)
+}
+
+// limitedLog aggregates rate-limit refusals.
+type limitedLog struct {
+	mu sync.Mutex
+	m  map[string]*limitedEntry
+}
+
+type limitedEntry struct {
+	tenant, user, service, op, ip, transport string
+	n                                        int
+}
+
+// note counts a refusal and reports whether it is the first since the last flush.
+func (l *limitedLog) note(tenant, user, service, op, ip, transport string) bool {
+	k := tenant + "\x00" + user + "\x00" + service + "\x00" + op
+	l.mu.Lock()
+	if l.m == nil {
+		l.m = map[string]*limitedEntry{}
+	}
+	e := l.m[k]
+	if e == nil {
+		if len(l.m) >= 10000 { // bounded: an attacker with many identities cannot grow it
+			l.mu.Unlock()
+			return false
+		}
+		e = &limitedEntry{tenant: tenant, user: user, service: service, op: op, ip: ip, transport: transport}
+		l.m[k] = e
+	}
+	e.n++
+	l.mu.Unlock()
+	return e.n == 1
+}
+
+// flush writes one audit entry per user and operation that was refused.
+func (s *Server) flushLimited() {
+	s.limited.mu.Lock()
+	m := s.limited.m
+	s.limited.m = nil
+	s.limited.mu.Unlock()
+	for _, e := range m {
+		if e.n > 1 { // the first was written when it happened
+			s.record(audit.Event{Tenant: e.tenant, Actor: e.user, Service: e.service, Action: e.op, Outcome: audit.Denied, Code: "rate_limited",
+				IP: e.ip, Transport: e.transport, Meta: map[string]any{"refused": e.n - 1, "further": true}})
+		}
+	}
 }

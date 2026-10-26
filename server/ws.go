@@ -32,13 +32,15 @@ import (
 // delivery to different users never contends, and neither does connecting or
 // disconnecting on another shard.
 type hubs struct {
-	s       *Server
-	shards  []*shard
-	pending sync.Map // connection id -> *session, between the upgrade and OnConnect
-	conns   atomic.Int64
-	sent    atomic.Int64
-	dropped atomic.Int64
-	cfg     ws.Config
+	s          *Server
+	shards     []*shard
+	pending    sync.Map // connection id -> *session, between the upgrade and OnConnect
+	conns      atomic.Int64
+	sent       atomic.Int64
+	dropped    atomic.Int64
+	slowClosed atomic.Int64
+	tenants    sync.Map // tenant -> *atomic.Int64, connections open on this node
+	cfg        ws.Config
 }
 
 type shard struct {
@@ -131,6 +133,11 @@ func (h *hubs) close() {
 
 func (h *hubs) shardFor(key string) *shard { return h.shards[fnv32(key)%uint32(len(h.shards))] }
 
+func (h *hubs) tenantCount(t string) *atomic.Int64 {
+	v, _ := h.tenants.LoadOrStore(t, new(atomic.Int64))
+	return v.(*atomic.Int64)
+}
+
 func (h *hubs) count() int { return int(h.conns.Load()) }
 
 func (h *hubs) counters() (sent, dropped int64) { return h.sent.Load(), h.dropped.Load() }
@@ -175,6 +182,7 @@ func (sh *shard) attach(ec *ws.EventConn) {
 	sh.users[c.key] = append(append([]*conn(nil), sh.users[c.key]...), c)
 	sh.mu.Unlock()
 	sh.h.conns.Add(1)
+	sh.h.tenantCount(sess.who.Tenant).Add(1)
 	exp := ""
 	if e := sess.expires.Load(); e != 0 {
 		exp = time.Unix(0, e).UTC().Format(time.RFC3339)
@@ -206,6 +214,7 @@ func (sh *shard) detach(ec *ws.EventConn, cause error) {
 	}
 	c.cancel()
 	sh.h.conns.Add(-1)
+	sh.h.tenantCount(c.sess.who.Tenant).Add(-1)
 	meta := map[string]any{"seconds": int(sh.h.s.cfg.Now().Sub(c.sess.opened).Seconds())}
 	if cause != nil {
 		meta["cause"] = cause.Error()
@@ -243,6 +252,7 @@ func (h *hubs) deliver(tenant, user, event string, data json.RawMessage, from st
 		default:
 			h.dropped.Add(1)
 			if c.slow.CompareAndSwap(false, true) {
+				h.slowClosed.Add(1)
 				go func(c *conn) {
 					h.s.record(audit.Event{Tenant: c.sess.who.Tenant, Actor: c.sess.who.ID, Action: "ws.slow_client", Outcome: audit.Denied, Code: "slow_client", IP: c.sess.ip, Transport: "ws", Conn: c.ec.ID})
 					_ = c.ec.Close(ws.ClosePolicyViolation, "slow client")
@@ -309,7 +319,7 @@ func (s *Server) upgrade(c fh.Ctx) error {
 	if err != nil {
 		return writeError(c, err)
 	}
-	if p.IsService() {
+	if p.IsService() && p.User == "" {
 		if p, err = p.WithUser(strings.Clone(c.Get("X-RTC-User"))); err != nil {
 			return writeError(c, &apiError{400, "user_required", "a service names the user it acts for in X-RTC-User"})
 		}
@@ -318,6 +328,10 @@ func (s *Server) upgrade(c fh.Ctx) error {
 	sh := s.hubs.shardFor(key)
 	if int(s.hubs.conns.Load()) >= s.cfg.MaxConnections {
 		return writeError(c, &apiError{503, "server_full", ""})
+	}
+	if m := s.cfg.MaxConnsPerTenant; m > 0 && int(s.hubs.tenantCount(p.Tenant).Load()) >= m {
+		s.record(audit.Event{Tenant: p.Tenant, Actor: p.User, Service: p.Service, Action: "ws.open", Outcome: audit.Denied, Code: "tenant_full", IP: ip, Transport: "ws"})
+		return writeError(c, &apiError{429, "tenant_full", ""})
 	}
 	sh.mu.RLock()
 	n := len(sh.users[key])

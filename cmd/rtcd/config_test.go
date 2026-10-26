@@ -89,11 +89,15 @@ func TestMistakesInTheConfigAreErrorsNotDefaults(t *testing.T) {
 	}
 }
 
-func TestOnlySQLiteIsLinkedIn(t *testing.T) {
+func TestDatabaseDriversAreChecked(t *testing.T) {
 	fc := fileConfig{}
 	fc.Database.Driver = "postgres"
-	if _, _, err := build(fc); err == nil || !strings.Contains(err.Error(), "sqlite") {
-		t.Fatalf("%v", err)
+	if _, _, err := build(fc); err == nil || !strings.Contains(err.Error(), "dsn is required") {
+		t.Fatalf("a server database with no dsn: %v", err)
+	}
+	fc.Database.Driver, fc.Database.DSN = "oracle", "x"
+	if _, _, err := build(fc); err == nil || !strings.Contains(err.Error(), "sqlite, postgres or mysql") {
+		t.Fatalf("an unknown driver: %v", err)
 	}
 	fc.Database.Driver, fc.UDPPortMin = "", -1
 	if _, _, err := build(fc); err == nil {

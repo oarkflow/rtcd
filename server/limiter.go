@@ -92,3 +92,17 @@ func fnv32(s string) uint32 {
 	}
 	return h
 }
+
+// exhausted reports whether the key has used up its tokens, without using one.
+func (l *limiters) exhausted(key string, now time.Time) bool {
+	sh := &l.shards[fnv32(key)%uint32(len(l.shards))]
+	sh.mu.Lock()
+	b := sh.m[key]
+	sh.mu.Unlock()
+	if b == nil {
+		return false
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.tokens+now.Sub(b.last).Seconds()*b.rate < 1
+}

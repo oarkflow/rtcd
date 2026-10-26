@@ -34,6 +34,7 @@ var (
 	ErrRecordingDisabled = errors.New("sfu: recording is not enabled on this server")
 	ErrRecording         = errors.New("sfu: the room is already being recorded")
 	ErrNotRecording      = errors.New("sfu: the room is not being recorded")
+	ErrDiskFull          = errors.New("sfu: not enough free disk space to record")
 	// ErrRecordingE2EE: the server holds only ciphertext of an encrypted call.
 	ErrRecordingE2EE = errors.New("sfu: an end-to-end encrypted call cannot be recorded by the server, which never has the keys")
 )
@@ -107,6 +108,11 @@ func (s *Server) StartRecording(roomID, by string) (RecordingInfo, error) {
 	if r.e2ee.Load() {
 		return RecordingInfo{}, ErrRecordingE2EE
 	}
+	if s.cfg.RecordMinFree > 0 {
+		if free, ok := freeBytes(s.cfg.RecordDir); ok && free < s.cfg.RecordMinFree {
+			return RecordingInfo{}, ErrDiskFull
+		}
+	}
 	now := time.Now().UTC()
 	rec := &recording{
 		dir:   filepath.Join(s.cfg.RecordDir, safeName(roomID), now.Format("20060102T150405Z")),
@@ -137,6 +143,7 @@ func (s *Server) StartRecording(roomID, by string) (RecordingInfo, error) {
 	if n, ok := s.sig.(RecordingNotifier); ok {
 		_ = n.Recording(roomID, true, by, users)
 	}
+	go s.watchRecording(r, rec)
 	return rec.snapshot(), nil
 }
 
@@ -556,4 +563,47 @@ func (p *partRec) files() []RecordingFile {
 		out = append(out, p.cur.file)
 	}
 	return out
+}
+
+// watchRecording ends a recording that has run too long, or that is filling
+// the disk, so an unattended recording cannot take the machine down with it.
+func (s *Server) watchRecording(r *room, rec *recording) {
+	if s.cfg.RecordMaxDuration <= 0 && s.cfg.RecordMinFree == 0 {
+		return
+	}
+	tick := time.NewTicker(10 * time.Second)
+	defer tick.Stop()
+	for {
+		select {
+		case <-tick.C:
+		case <-s.stop:
+			return
+		}
+		if r.rec.Load() != rec {
+			return // stopped by someone
+		}
+		over := s.cfg.RecordMaxDuration > 0 && time.Since(rec.info.StartedAt) >= s.cfg.RecordMaxDuration
+		if !over && s.cfg.RecordMinFree > 0 {
+			if free, ok := freeBytes(s.cfg.RecordDir); ok && free < s.cfg.RecordMinFree/2 {
+				over = true
+			}
+		}
+		if over {
+			if r.rec.CompareAndSwap(rec, nil) {
+				rec.finish()
+				r.mu.Lock()
+				users := make([]string, 0, len(r.peers))
+				for u, p := range r.peers {
+					if !p.relay {
+						users = append(users, u)
+					}
+				}
+				r.mu.Unlock()
+				if n, ok := s.sig.(RecordingNotifier); ok {
+					_ = n.Recording(r.id, false, "system", users)
+				}
+			}
+			return
+		}
+	}
 }

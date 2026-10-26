@@ -95,6 +95,75 @@ Sending a hundred people to a hundred people is neither possible (a hundred medi
 
 Measured in-process with 100 real Pion peers, each publishing a microphone, `last_n_audio 16`: all connected and negotiated in about 0.7 s, 2.4 offers per person (`go test -run AHundredPeopleShare -v ./sfu`). That proves the control plane and the selection; it is loopback, audio only, and says nothing about bandwidth or CPU under real video. Measure that with your own load.
 
+## Messages and attachments
+
+Both work inside **groups**: a conversation is a group (a direct message is a group of two), so only its members can send, read or fetch, and a removed member is cut off on their next request. Both need the `chat` scope, which tokens carry by default.
+
+The service stores and forwards **opaque** data. A message `body` is ciphertext your client made (the audit log records its size, never its content); an attachment is a ciphertext blob, and its key travels inside an encrypted message. What the server enforces is who, how big, how fast, and how long.
+
+| | |
+|---|---|
+| `msg.send {conv, id, body}` | `id` is yours and unique per sender: a retry returns the stored message (`duplicate: true`) instead of a second one. Answers `{seq}`; every member (the sender's other devices too) gets `msg.new`. Body ≤ 32 KiB (`max_message_bytes`). `POST /v1/messages` |
+| `msg.history {conv, after, before, limit}` | oldest first from `after`, or newest first before `before`. ≤ 100. `POST /v1/messages/history` |
+| `msg.read {conv, seq}` · `msg.delete {conv, seq}` | read position (members get `msg.read`); delete by the sender or a group admin (the number stays, the body goes; `msg.deleted`) |
+| `file.init {conv, size, sha256, chunk}` | registers an upload of the **encrypted** bytes; `sha256` is of those bytes. Chunk ≤ 4 MiB (default 1 MiB), file ≤ `max_file_bytes` (256 MiB), 10 uploads under way per user, `tenant_file_bytes` per tenant |
+| `PUT /v1/files/{id}/parts/{n}` | raw bytes of part `n`, exactly the chunk size (the last part is the remainder). Parts may be sent in any order and repeated |
+| `file.status {file}` | which parts have arrived, to resume after a dropped connection |
+| `file.complete {file}` | checks every part is there and the stored bytes hash to `sha256`. A mismatch deletes the file (`checksum_mismatch`). Until then it cannot be downloaded |
+| `GET /v1/files/{id}/blob` | members only; supports `Range`. Served as `application/octet-stream`, `nosniff`, `attachment`, `no-store` |
+| `file.link {file}` | a 5-minute URL for one user (an `<a href>` or a download manager that cannot send a header). Membership is checked again when it is used |
+| `file.delete {file}` | owner or group admin |
+
+Unfinished uploads are removed after 24 h; finished files after `file_retention` (30 days); messages after `message_retention` (never, by default). Settings: `attach_dir` (empty turns attachments off), `max_file_bytes`, `tenant_file_bytes`, `file_retention`, `message_retention`, `max_message_bytes`.
+
+## Security additions
+
+- **WebSocket tickets.** `POST /v1/ws/ticket` (or the `ws.ticket` operation) trades a token for a ticket good for one connection within 30 s: `wss://…/v1/ws?ticket=…`. Prefer it to `?token=`, which ends up in proxy logs. Tickets are kept (as a hash) in the database, so any node can redeem one.
+- **Revocation.** A backend calls `token.revoke {user}` (`POST /v1/tokens/revoke`): tokens already minted for that user stop working and their open connections close. Tokens minted afterwards work. It is stored in the database: every node learns of it within about 2 s and closes that user's connections, and a restart forgets nothing. A ticket issued before the revocation is refused too.
+- **Failed sign-ins are throttled per address**: after a burst of 20 (then one every 2 s) a bad credential is answered `429 rate_limited` and stops being logged entry by entry. A *good* credential is never held back, so people behind a shared address are not locked out by someone else's mistakes.
+- **`rate_limited` answers are logged in summary.** The first refusal for a user and operation is written at once; the rest are counted and written as one entry every few seconds. A client that retries in a tight loop therefore cannot fill the audit log and stall everyone behind it (this was measured: 120 000 refusals in a load run made every other operation wait on the audit queue).
+- **Header and idle timeouts** on the HTTP server (10 s, 2 min), so slow-header connections cannot be held open. A WebSocket is not affected.
+- `limits { max_connections_per_tenant }` stops one tenant filling the node.
+
+## Large rooms
+
+In a room of more than 16 people, `sfu.peer` and `sfu.speaker` events are batched (250 ms): the room hears one `sfu.peers {joined[], left[], count}` and one `sfu.speaker` for what changed, not an event per person per change. A hundred people arriving no longer send each of them a hundred events, which used to fill a writer queue and disconnect someone who had done nothing wrong. Rooms of 16 or fewer are unchanged. `room.get` is the snapshot.
+
+Recording: `record_min_free_bytes` refuses to start (`disk_full`, 507) and stops a recording under way when the recording directory runs low; `record_max_duration` stops one after that long. Everyone is told when it stops.
+
+## Several nodes
+
+Run any number of rtcd nodes on one shared database and give each a `node_id` (`node_id "n1"`). Then:
+
+- **Events reach people on any node.** Call, group, message and room events are written to an outbox table that the other nodes poll every 200 ms and deliver to their own connections. A message sent on one node reaches a member connected to another; group changes drop every node's membership cache.
+- **Revocations and tickets are shared** (see Security additions).
+- **Media stays on one node.** An SFU room lives on the node that holds it, so `sfu.*` events are not replicated. The load balancer must send every request for a call (`/v1/calls/{id}/…`, and the WebSocket of anyone in it) to the same node, e.g. by hashing the call id. Spreading the SFU over nodes is the cascade in `sfu`, which is not wired to HTTP yet.
+- **Files** need `attach_dir` on a volume every node mounts, or one node serving them.
+- The database must be shared: SQLite works only for nodes on one machine; use PostgreSQL or MySQL for nodes on different machines (see *Databases*).
+- Cross-node delivery costs up to ~200 ms plus a database write per event, so a single node (no `node_id`) is still the fastest setup.
+
+## Browser side: chat
+
+`web/chat-core.js` (global `ChatCrypto`) encrypts messages and attachments in the browser, with the keys and formats described at its top. Messages are `encryptMessage(key, {conv, sender, id}, text)`; files are `encryptFile(conv, bytes)` then `uploadFile(api, conv, enc)` (resumable), and `downloadFile(api, conv, id, meta)`. Put `{file: id, meta: enc.meta}` in an encrypted message. A message over `MAX_INLINE` (22 000 bytes) must go as a file. Conversation keys are handed to each member with `wrapKey` / `unwrapKey` (ECDH P-256); compare `safetyCode` out of band. `node --test web/test/chat-core.test.js`.
+
+## Databases
+
+rtcd runs on SQLite, PostgreSQL or MySQL, chosen by `database { driver … dsn … }`. All three are tested: the server suite runs on each (`RTCD_TEST_DB=postgres|mysql go test ./server`, against servers named by `RTCD_PG_DSN` / `RTCD_MYSQL_DSN`; the defaults match `docker run -p 55432:5432 postgres` and `-p 53306:3306 mysql`).
+
+Designed so that a node never has several queries of the same kind in flight:
+
+- **Messages: one statement, and often one for many.** A message is one `INSERT`: its number comes from a counter held in memory under the conversation's lock, and a collision with another node is a primary-key error that reloads the counter and retries. Messages that arrive for one conversation while a write is under way are **group-committed** into the next `INSERT`.
+- **Membership: one query, once.** The roster of a group is a single join. It is cached for 5 s, dropped at once by any group change (on every node within the poll interval), and a miss that many requests hit together is loaded **once** (the others wait for it).
+- **Cross-node events: one writer, one reader.** Events from a burst are gathered for 20 ms and written with multi-row `INSERT`s; one message to a 200-member group is one row, not 200, even when other events interleave. Each node polls the outbox with one query every 200 ms (and ids that committed late are looked for again for 3 s, which matters on PostgreSQL and MySQL where concurrent writers' ids become visible out of order).
+- **Attachments:** a file's record is read once per few seconds, not for each of its parts.
+- **The pool is a hard bound.** `max_open` caps the statements a node runs at once whatever the load.
+
+Measured on PostgreSQL 16 (Docker, same machine), 200 members each sending 5 messages to one group with the cross-node outbox on: 200 000 deliveries in 1.8 s (about 110 000/s), **at most 3 statements running at once** (sampled from `pg_stat_activity`), **0.2 transactions per message** counting the outbox and the audit log, nothing dropped. The same run on MySQL 8 and SQLite also completes with none lost. Reproduce: `RTCD_TEST_DB=postgres RTCD_CHAT_LOAD=1 go test -run ChatFanOut -v ./server`.
+
+## Browser example
+
+`go run ./examples/demo` starts rtcd with a complete browser client ([`examples/demo`](examples/demo)): sign in with any name, end-to-end encrypted group chat, encrypted attachments with progress and previews, group video calls with per-frame encryption, safety codes, and a **Diagnostics** page that checks the service from the browser (20 checks: tickets, encryption, resume, rate limits, revocation, call signalling). Open it in two windows with two names. See its README, including how to run it against PostgreSQL or MySQL and how to run the automated browser test.
+
 ## Groups
 
 A user can make groups, and call them. The creator owns the group; the owner can make members admins; owners and admins add and remove members; anyone can leave except the owner, who must hand the group over or delete it. Only members can see a group, and a group that exists looks exactly like one that does not. `group.call` rings every other member, or, if the group already has a call under way, puts the caller into it. Two members calling at the same moment end up in one call. Limits: `groups.max_owned` (100 per user), `groups.max_members` (200).
@@ -131,6 +200,8 @@ Measured on one 10-core laptop (Apple silicon), SQLite, loopback; reproduce with
 | Audit store stalled completely | 500 relays take the same time as when healthy; the backlog absorbs them |
 | Audit store sustained write rate (SQLite) | roughly 13 000–70 000 entries/s depending on batching; sustained relaying above that fills the backlog and then waits. Real call traffic is far below this: a relay happens a few times per participant per join or leave |
 
+Group chat, measured the same way (`RTCD_CHAT_LOAD=1 go test -run ChatFanOut -v ./server`): 200 members each sending 5 messages to the group, 200 000 deliveries over real WebSockets in 1.6 s (about 120 000 deliveries/s) with none lost or dropped; ack p50 0.3 s, p99 0.44 s, which is 200 senders queueing on SQLite's single writer.
+
 Defaults: 32 shards, 20 000 connections per node, 8 per user, 256-event writer queue (all under `limits`).
 
 ## Configuration (`rtcd.bcl`)
@@ -159,8 +230,8 @@ udp_port_max 50100
 | `listen` | default `:8480` |
 | `tls_cert`, `tls_key` | serve TLS directly |
 | `insecure_http` | accept non-local plain HTTP (only behind a proxy that ends TLS and sets `X-Forwarded-Proto: https`, or for development). Off by default: without TLS, only requests from this machine are accepted |
-| `database { driver dsn }` | `driver` is `sqlite` |
-| `audit { dsn file queue }` | a database of its own for the log (recommended with SQLite), a JSONL file, and the backlog size |
+| `database { driver dsn max_open max_idle max_lifetime }` | `driver` is `sqlite`, `postgres` or `mysql`. `max_open` (default 20; SQLite is always 1) is the most connections this node holds, so the most statements it runs at once; `max_lifetime` default 30m |
+| `audit { dsn file queue }` | a database of its own for the log (recommended with SQLite; same driver as `database`), a JSONL file, and the backlog size |
 | `key "name" { key tenant }` | one block per backend service; keys are at least 24 characters. Repeat the block for more services |
 | `token_secret` | signs tokens, at least 24 characters |
 | `max_token_ttl` | default `"1h"` |
@@ -169,6 +240,10 @@ udp_port_max 50100
 | `allow_plaintext` | allow calls without end-to-end encryption (default false) |
 | `ring_timeout`, `max_invitees` | `"45s"`, 20 |
 | `groups { max_owned max_members }` | |
+| `node_id` | names this node when several share a database |
+| `attach_dir`, `max_file_bytes`, `tenant_file_bytes`, `file_retention`, `message_retention`, `max_message_bytes` | messages and attachments |
+| `record_min_free_bytes`, `record_max_duration` | recording safeguards |
+| `limits { conv_messages_per_second conv_message_burst }` | messages a conversation accepts per second in all (default 50, burst 100). A sender over it gets `rate_limited` and retries the same message; it keeps every member's queue (`writer_queue`, 256) from being overrun by a burst. Keep the burst below the queue |
 | `limits { shards max_connections max_connections_per_user writer_queue ops_per_second ops_burst relay_per_second relay_burst }` | |
 | `last_n_video`, `last_n_audio`, `max_room_members` | large rooms (above) |
 | `udp_port_min`, `udp_port_max`, `public_ips`, `max_peers`, `max_rooms`, `reconnect_grace`, `offer_timeout`, `initial_kbps` | SFU |
@@ -206,8 +281,7 @@ Service-level: keys are compared in constant time over their hashes; tokens are 
 
 ## Not done yet
 
-- **Several nodes.** Events, connections and SFU rooms are per node; there is no backplane, node registry or HTTP cascade link, so run one rtcd (or route a user's and a call's traffic to one node). The call cache is also only coherent with writes made through the same node. The cascade exists in `sfu` and passes its tests in one process.
-- **Only SQLite** is linked into the binary (the stores speak postgres/mysql dialects).
+- **SFU across nodes.** A room lives on one node (see *Several nodes*). The cascade exists in `sfu` and passes its tests in one process, but has no HTTP link between nodes.
 - Webhooks to the backend (it learns of events by holding a socket as a user).
 - No per-tenant quotas, only per-user limits.
 - Safari and Firefox: the managed-room flow and encrypted group calls were run in Playwright's WebKit and Firefox (three browsers, key rotation on a leave, a removal) from the Aura repository's `web/e2e/sfu`, with fake cameras. That is the engines, not Safari itself, and not a phone.

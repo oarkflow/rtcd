@@ -119,6 +119,11 @@ type Config struct {
 	// browsers play as one picture but ffmpeg's native decoder shows layer by
 	// layer; "lowest" stores one layer that every decoder plays alike.
 	RecordLayer string
+	// RecordMinFree refuses to start a recording, and stops one under way, when
+	// the recording directory has less than this many bytes free (0: no check).
+	// RecordMaxDuration stops a recording after this long (0: no limit).
+	RecordMinFree     uint64
+	RecordMaxDuration time.Duration
 	// Loopback includes loopback candidates; for tests only.
 	Loopback bool
 

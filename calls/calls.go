@@ -19,6 +19,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/oarkflow/rtcd/dbx"
 	"strconv"
 	"strings"
 	"time"
@@ -194,7 +195,7 @@ func Open(ctx context.Context, db *sql.DB, o Options) (*Store, error) {
 		`CREATE TABLE IF NOT EXISTS rtc_participants (call_id ` + key + ` NOT NULL, user_id ` + key + ` NOT NULL,
 			state ` + key + ` NOT NULL, PRIMARY KEY (call_id, user_id))`,
 	} {
-		if _, err := db.ExecContext(ctx, q); err != nil {
+		if err := dbx.DDL(ctx, db, o.Dialect, q); err != nil {
 			return nil, fmt.Errorf("calls: schema: %w", err)
 		}
 	}
@@ -467,7 +468,7 @@ func (s *Store) finish(ctx context.Context, c Call, reason, by string) (Call, er
 		return c, nil
 	}
 	now := s.o.Now()
-	res, err := s.exec(ctx, `UPDATE rtc_calls SET status = $1, reason = $2, ended_at = $3 WHERE id = $4 AND status <> $1`, Ended, reason, ts(now), c.ID)
+	res, err := s.exec(ctx, `UPDATE rtc_calls SET status = $1, reason = $2, ended_at = $3 WHERE id = $4 AND status <> $5`, Ended, reason, ts(now), c.ID, Ended)
 	s.cache.drop(c.ID)
 	if err != nil {
 		return c, err

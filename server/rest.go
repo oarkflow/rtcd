@@ -25,6 +25,8 @@ func routes() []route {
 		{"POST", "/v1/audit/query", "audit.query", ""},
 		{"POST", "/v1/audit/verify", "audit.verify", ""},
 		{"POST", "/v1/ice", "ice", ""},
+		{"POST", "/v1/ws/ticket", "ws.ticket", ""},
+		{"POST", "/v1/tokens/revoke", "token.revoke", ""},
 		{"POST", "/v1/calls", "call.start", ""},
 		{"GET", "/v1/calls/:id", "call.get", "call"},
 		{"POST", "/v1/groups", "group.create", ""},
@@ -163,12 +165,34 @@ func (s *Server) identify(c fh.Ctx, queryToken bool, ip, transport string) (auth
 		s.auditAnon("auth.rejected", "tls_required", ip, transport)
 		return auth.Principal{}, &apiError{426, "tls_required", ""}
 	}
+	now := s.cfg.Now()
 	cred := auth.Bearer(c.Get("Authorization"))
 	if cred == "" && queryToken {
+		if t := strings.Clone(c.Query("ticket")); t != "" {
+			if p, ok := s.redeemTicket(c.Context(), t); ok && !(!p.Expires.IsZero() && !now.Before(p.Expires)) {
+				return p, nil
+			}
+			if s.authFail.exhausted(ip, now) {
+				return auth.Principal{}, &apiError{429, "rate_limited", "too many failed sign-ins from this address"}
+			}
+			s.authFail.allow(ip, now)
+			s.auditAnon("auth.failed", "unauthenticated", ip, transport)
+			return auth.Principal{}, unauth("unauthenticated")
+		}
 		cred = strings.Clone(c.Query("token"))
 	}
 	p, err := s.auth.Authenticate(cred)
 	if err != nil {
+		// An address that keeps presenting bad credentials is told so, and its
+		// failures stop being logged one by one. A good credential is never held
+		// back by this: people behind a shared address are not locked out by
+		// someone else's mistakes (the keys are long enough that guessing is not
+		// what this protects against; the log and the CPU are).
+		if s.authFail.exhausted(ip, now) {
+			s.auditAnon("auth.throttled", "rate_limited", ip, transport)
+			return auth.Principal{}, &apiError{429, "rate_limited", "too many failed sign-ins from this address"}
+		}
+		s.authFail.allow(ip, now)
 		s.auditAnon("auth.failed", "unauthenticated", ip, transport)
 		return auth.Principal{}, unauth("unauthenticated")
 	}

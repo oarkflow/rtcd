@@ -24,6 +24,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/oarkflow/rtcd/dbx"
 	"os"
 	"strings"
 	"sync"
@@ -163,7 +164,7 @@ func Open(ctx context.Context, cfg Config) (*Log, error) {
 		`CREATE INDEX IF NOT EXISTS rtc_audit_target ON rtc_audit (tenant, target, seq)`,
 		`CREATE INDEX IF NOT EXISTS rtc_audit_action ON rtc_audit (tenant, action, seq)`,
 	} {
-		if _, err := cfg.DB.ExecContext(ctx, q); err != nil {
+		if err := dbx.DDL(ctx, cfg.DB, cfg.Dialect, q); err != nil {
 			return nil, fmt.Errorf("audit: schema: %w", err)
 		}
 	}
@@ -519,8 +520,10 @@ func (l *Log) Query(ctx context.Context, tenant string, f Filter) ([]Event, erro
 	}
 	if f.Action != "" {
 		if strings.HasSuffix(f.Action, ".") {
-			add("action >= $%d", f.Action)
-			add("action < $%d", f.Action+"\U0010ffff")
+			// LIKE, not a string range: how strings sort depends on the database's
+			// collation, and a range with a high sentinel matches nothing on some.
+			esc := strings.NewReplacer("!", "!!", "%", "!%", "_", "!_").Replace(f.Action)
+			add("action LIKE $%d ESCAPE '!'", esc+"%")
 		} else {
 			add("action = $%d", f.Action)
 		}

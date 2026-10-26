@@ -23,6 +23,8 @@ import (
 	"github.com/oarkflow/rtcd/audit"
 	"github.com/oarkflow/rtcd/auth"
 	"github.com/oarkflow/rtcd/calls"
+	"github.com/oarkflow/rtcd/chat"
+	"github.com/oarkflow/rtcd/dbx"
 	"github.com/oarkflow/rtcd/groups"
 	"github.com/oarkflow/rtcd/sfu"
 	"github.com/pion/webrtc/v4"
@@ -90,6 +92,23 @@ type Config struct {
 	InitialKbps                            int
 	RecordDir                              string
 	RecordLayer                            string
+	RecordMinFree                          uint64
+	RecordMaxDuration                      time.Duration
+
+	// Chat. AttachDir is where encrypted attachments are kept (empty: attachments
+	// are off). MaxFileBytes caps one file (default 256 MiB), TenantFileBytes all
+	// of a tenant's files (0: no cap). FileRetention is how long a finished file
+	// is kept (default 30 days), MsgRetention how long a message is (0: forever).
+	AttachDir       string
+	MaxFileBytes    int64
+	TenantFileBytes int64
+	FileRetention   time.Duration
+	MsgRetention    time.Duration
+	MaxMessageBytes int
+
+	// NodeID names this node when several share one database; set it to relay
+	// events between them (see cluster.go). Empty: a single node.
+	NodeID string
 
 	// Connections.
 	// Shards splits connections over independent hubs so connecting and
@@ -99,6 +118,9 @@ type Config struct {
 	MaxConnections int
 	// MaxConnsPerUser caps one user's connections. Default 8.
 	MaxConnsPerUser int
+	// MaxConnsPerTenant caps one tenant's connections on this node, so one tenant
+	// cannot fill the node (0: no cap).
+	MaxConnsPerTenant int
 	// WriterQueue is how many events one connection may have waiting before it
 	// is dropped as too slow. Default 256.
 	WriterQueue int
@@ -107,6 +129,11 @@ type Config struct {
 	// RelayPerSecond is per user per call for signaling and key messages.
 	OpsPerSecond, OpsBurst     float64
 	RelayPerSecond, RelayBurst float64
+	// ConvPerSecond is how many messages a conversation (all its senders together)
+	// accepts per second, with a burst of ConvBurst. It bounds what every member
+	// is sent, so that a burst can never fill a reader's queue (WriterQueue) and
+	// get them disconnected. Keep ConvBurst below WriterQueue. Defaults 50 and 100.
+	ConvPerSecond, ConvBurst float64
 
 	// Now is for tests.
 	Now func() time.Time
@@ -118,6 +145,15 @@ func (c *Config) defaults() {
 	}
 	if c.RecordLayer == "" {
 		c.RecordLayer = "highest"
+	}
+	if c.MaxFileBytes <= 0 {
+		c.MaxFileBytes = defaultMaxFile
+	}
+	if c.FileRetention <= 0 {
+		c.FileRetention = 30 * 24 * time.Hour
+	}
+	if c.Rebind == nil {
+		c.Rebind = dbx.Rebind(c.Dialect)
 	}
 	if c.Shards <= 0 {
 		c.Shards = 32
@@ -137,6 +173,9 @@ func (c *Config) defaults() {
 	if c.RelayPerSecond == 0 {
 		c.RelayPerSecond, c.RelayBurst = 100, 200
 	}
+	if c.ConvPerSecond == 0 {
+		c.ConvPerSecond, c.ConvBurst = 50, 100
+	}
 	if c.AuditDB == nil {
 		c.AuditDB = c.DB
 	}
@@ -151,16 +190,24 @@ type Server struct {
 	auth   *auth.Authenticator
 	Store  *calls.Store
 	Groups *groups.Store
+	Chat   *chat.Store
 	SFU    *sfu.Server
 	Audit  *audit.Log
 
-	ops      map[string]*opDef
-	opLimit  *limiters
-	rlLimit  *limiters
-	anonFail *bucket // bounds the audit entries unauthenticated callers can cause
-	hubs     *hubs
-	tenants  sync.Map // call id -> tenant, for calls that have a room on this node
-	glocks   [64]sync.Mutex
+	ops       map[string]*opDef
+	opLimit   *limiters
+	rlLimit   *limiters
+	convLimit *limiters
+	limited   limitedLog
+	anonFail  *bucket // bounds the audit entries unauthenticated callers can cause
+	hubs      *hubs
+	fan       *fanout
+	convs     convCache
+	parts     sync.Map // tenant\x00file -> partEntry
+	cl        *cluster
+	authFail  *limiters // failed sign-ins per address
+	tenants   sync.Map  // call id -> tenant, for calls that have a room on this node
+	glocks    [64]sync.Mutex
 
 	opsOK, opsFailed, opsDenied atomic.Int64
 	auditRefused                atomic.Int64
@@ -193,9 +240,12 @@ func New(ctx context.Context, cfg Config) (*Server, error) {
 		return nil, err
 	}
 	s := &Server{cfg: cfg, auth: a, ops: map[string]*opDef{}, stop: make(chan struct{}),
-		opLimit: newLimiters(cfg.OpsPerSecond, cfg.OpsBurst), rlLimit: newLimiters(cfg.RelayPerSecond, cfg.RelayBurst),
+		opLimit: newLimiters(cfg.OpsPerSecond, cfg.OpsBurst), rlLimit: newLimiters(cfg.RelayPerSecond, cfg.RelayBurst), convLimit: newLimiters(cfg.ConvPerSecond, cfg.ConvBurst),
 		anonFail: newBucket(20, 100, cfg.Now())}
 	s.hubs = newHubs(s)
+	s.fan = newFanout(s)
+	s.authFail = newLimiters(0.5, 20)
+	s.auth.SetRetention(2 * cfg.MaxTokenTTL)
 
 	s.Audit, err = audit.Open(ctx, audit.Config{DB: cfg.AuditDB, Dialect: cfg.Dialect, Rebind: cfg.Rebind, File: cfg.AuditFile, Queue: cfg.AuditQueue,
 		OnError: func(err error) { fmt.Fprintf(os.Stderr, "rtcd: audit write failed, retrying: %v\n", err) }})
@@ -216,6 +266,16 @@ func New(ctx context.Context, cfg Config) (*Server, error) {
 	if err != nil {
 		return nil, err
 	}
+	s.Chat, err = chat.Open(ctx, cfg.DB, chat.Options{Dialect: cfg.Dialect, Rebind: cfg.Rebind, MaxBody: cfg.MaxMessageBytes, Now: cfg.Now})
+	if err != nil {
+		return nil, err
+	}
+	if cfg.AttachDir != "" {
+		if err := os.MkdirAll(cfg.AttachDir, 0o750); err != nil {
+			return nil, fmt.Errorf("rtcd: attach_dir: %w", err)
+		}
+	}
+	s.initConvs()
 	var ice []webrtc.ICEServer
 	if len(cfg.STUN) > 0 {
 		ice = append(ice, webrtc.ICEServer{URLs: cfg.STUN})
@@ -223,12 +283,20 @@ func New(ctx context.Context, cfg Config) (*Server, error) {
 	s.SFU, err = sfu.New(sfu.Config{
 		ICEServers: ice, UDPPortMin: cfg.UDPPortMin, UDPPortMax: cfg.UDPPortMax, PublicIPs: cfg.PublicIPs, NetworkTypes: cfg.NetworkTypes, Interfaces: cfg.Interfaces,
 		MaxPeers: cfg.MaxPeers, MaxRooms: cfg.MaxRooms, LastNVideo: cfg.LastNVideo, LastNAudio: cfg.LastNAudio, ReconnectGrace: cfg.ReconnectGrace, OfferTimeout: cfg.OfferTimeout,
-		InitialKbps: cfg.InitialKbps, RecordDir: cfg.RecordDir, RecordLayer: cfg.RecordLayer,
+		InitialKbps: cfg.InitialKbps, RecordDir: cfg.RecordDir, RecordLayer: cfg.RecordLayer, RecordMinFree: cfg.RecordMinFree, RecordMaxDuration: cfg.RecordMaxDuration,
 	}, s)
 	if err != nil {
 		return nil, err
 	}
+	if err := s.openCluster(ctx); err != nil {
+		return nil, err
+	}
+	s.wg.Add(1)
+	go s.cl.run()
 	s.registerOps()
+	s.registerSecurity()
+	s.registerChat()
+	s.registerFiles()
 	s.hubs.bind()
 	s.wg.Add(1)
 	go s.background()
@@ -264,13 +332,22 @@ func (s *Server) background() {
 		case <-t.C:
 			now := s.cfg.Now()
 			s.hubs.expire(now)
+			s.flushLimited()
 			if n%2 == 0 {
 				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 				_, _ = s.Store.Sweep(ctx)
 				cancel()
 			}
+			if n%12 == 1 {
+				s.sweepFiles()
+				if s.cfg.MsgRetention > 0 {
+					_, _ = s.Chat.Prune(context.Background(), s.cfg.MsgRetention)
+				}
+			}
 			if n%12 == 0 {
 				s.opLimit.sweep(now, 5*time.Minute)
+				s.authFail.sweep(now, 5*time.Minute)
+				s.convLimit.sweep(now, 5*time.Minute)
 				s.rlLimit.sweep(now, 5*time.Minute)
 			}
 			if c := s.anonSuppressed.Swap(0); c > 0 {
@@ -295,6 +372,7 @@ func (s *Server) Mount(app *fh.App) {
 	})
 	app.Get("/v1/ws", s.upgrade)
 	s.mountREST(app)
+	s.mountFiles(app)
 }
 
 // Stats are what this node is carrying.
@@ -312,7 +390,7 @@ func (s *Server) Stats() Stats {
 	sent, dropped := s.hubs.counters()
 	return Stats{Rooms: st.Rooms, Peers: st.Peers, Connections: s.hubs.count(),
 		OpsOK: s.opsOK.Load(), OpsFailed: s.opsFailed.Load(), OpsDenied: s.opsDenied.Load(),
-		EventsSent: sent, EventsDropped: dropped, SlowClientsDisconnected: dropped,
+		EventsSent: sent, EventsDropped: dropped, SlowClientsDisconnected: s.hubs.slowClosed.Load(),
 		Audit: s.Audit.Stats(), AuditRefused: s.auditRefused.Load()}
 }
 
@@ -352,6 +430,9 @@ func (s *Server) Candidate(user, call string, c webrtc.ICECandidateInit) error {
 
 // Speaker implements sfu.SpeakerNotifier.
 func (s *Server) Speaker(call, speaker string, participants []string) error {
+	if s.fan.speaker(call, speaker, participants) {
+		return nil
+	}
 	for _, u := range participants {
 		_ = s.emit(call, u, "sfu.speaker", map[string]any{"call_id": call, "speaker": speaker})
 	}
@@ -360,6 +441,9 @@ func (s *Server) Speaker(call, speaker string, participants []string) error {
 
 // Peer implements sfu.PeerNotifier: everyone in the room hears who came or went.
 func (s *Server) Peer(call, user string, joined bool, everyone []string) error {
+	if s.fan.peer(call, user, joined, everyone) {
+		return nil
+	}
 	state := "left"
 	if joined {
 		state = "joined"

@@ -18,3 +18,6 @@ func (s *Server) ExecForBenchmark(user, tenant, op string, in json.RawMessage) e
 func (s *Server) DeliverForBenchmark(tenant, user string, data json.RawMessage) error {
 	return s.hubs.deliver(tenant, user, "bench", data, "x")
 }
+
+// RoomForTest makes a call id known to this node, as a joined room would.
+func (s *Server) RoomForTest(call, tenant string) { s.tenants.Store(call, tenant) }
