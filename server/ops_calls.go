@@ -172,7 +172,7 @@ func (s *Server) registerCalls() {
 
 // Notify implements calls.Notifier and groups.Notifier.
 func (s *Server) Notify(_ context.Context, tenant, user, event string, data json.RawMessage, from string) error {
-	if strings.HasPrefix(event, "group.") {
+	if strings.HasPrefix(event, "group.") || strings.HasPrefix(event, "conv.") {
 		s.dropConvs() // membership may have changed: the next message checks again
 	}
 	s.publish(tenant, user, event, data, from)

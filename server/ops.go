@@ -77,7 +77,9 @@ type opDef struct {
 	quiet bool
 	// relay operations carry messages between people and are limited per call.
 	relay bool
-	run   func(o *opCtx, raw json.RawMessage) (any, error)
+	// maxBody overrides the default request size limit (64 KiB).
+	maxBody int
+	run     func(o *opCtx, raw json.RawMessage) (any, error)
 }
 
 func (s *Server) register(d opDef) { s.ops[d.name] = &d }
@@ -131,13 +133,20 @@ func (s *Server) exec(ctx context.Context, sess *session, name string, raw json.
 	if !s.opLimit.allow(key, now) {
 		return nil, &apiError{429, "rate_limited", ""}
 	}
-	if len(raw) > maxBody {
+	if len(raw) > d.bodyLimit() {
 		return nil, &apiError{413, "too_large", ""}
 	}
 	return d.run(o, raw)
 }
 
 const maxBody = 64 << 10
+
+func (d *opDef) bodyLimit() int {
+	if d != nil && d.maxBody > 0 {
+		return d.maxBody
+	}
+	return maxBody
+}
 
 // relayAllowed applies the per-call limit for operations that carry messages
 // between people, so one participant cannot flood another's connection.

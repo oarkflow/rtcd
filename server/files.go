@@ -235,6 +235,9 @@ func (s *Server) mountFiles(app *fh.App) {
 		{"POST", "/v1/messages/history", "msg.history", ""},
 		{"POST", "/v1/messages/read", "msg.read", ""},
 		{"POST", "/v1/messages/delete", "msg.delete", ""},
+		{"POST", "/v1/messages/typing", "msg.typing", ""},
+		{"POST", "/v1/messages/cursors", "msg.cursors", ""},
+		{"POST", "/v1/messages/summary", "msg.summary", ""},
 	} {
 		app.Add(r.method, r.path, s.cors(s.rest(r)))
 		app.Options(r.path, s.preflight)

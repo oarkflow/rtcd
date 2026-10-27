@@ -117,6 +117,8 @@ type Client struct {
 	base string
 	key  string
 	HTTP *http.Client
+	// EdgeSecret, when the service requires one (edge_secret), is sent as X-RTC-Edge on every request.
+	EdgeSecret string
 }
 
 // New makes a Client for a backend service. baseURL is the service's root.
@@ -344,6 +346,9 @@ func (c *Client) do(ctx context.Context, method, path, actAs string, in, out any
 		return err
 	}
 	req.Header.Set("Authorization", "Bearer "+c.key)
+	if c.EdgeSecret != "" {
+		req.Header.Set("X-RTC-Edge", c.EdgeSecret)
+	}
 	if in != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}

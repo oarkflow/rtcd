@@ -11,10 +11,12 @@ package server
 
 import (
 	"context"
+	"crypto/subtle"
 	"database/sql"
 	"errors"
 	"fmt"
 	"os"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -105,6 +107,24 @@ type Config struct {
 	FileRetention   time.Duration
 	MsgRetention    time.Duration
 	MaxMessageBytes int
+	// MaxDevices caps the active device keys one user may publish (default 32).
+	MaxDevices int
+	// DeleteWindow is how long a sender may delete a message for everyone (0:
+	// always), unless the conversation sets its own.
+	DeleteWindow time.Duration
+	// MaxManagedMembers caps the people in one managed conversation (default 1000).
+	MaxManagedMembers int
+
+	// EdgeSecret, when set, makes rtcd answer only requests that carry it in X-RTC-Edge (health checks
+	// excepted). Set it to a value only the backend and its proxy know and rtcd stops being reachable by
+	// anyone else, whatever its network exposure and whatever credentials they hold: a user token or even a
+	// service key is useless without it. At least 24 characters.
+	EdgeSecret string
+
+	// Webhook, when set, receives a signed POST for each event the backend
+	// needs while a user may be offline (a new message to push, a rekey).
+	// WebhookSecret signs it (at least 16 characters).
+	WebhookURL, WebhookSecret string
 
 	// NodeID names this node when several share one database; set it to relay
 	// events between them (see cluster.go). Empty: a single node.
@@ -145,6 +165,12 @@ func (c *Config) defaults() {
 	}
 	if c.RecordLayer == "" {
 		c.RecordLayer = "highest"
+	}
+	if c.MaxDevices <= 0 {
+		c.MaxDevices = 32
+	}
+	if c.MaxManagedMembers <= 0 {
+		c.MaxManagedMembers = 1000
 	}
 	if c.MaxFileBytes <= 0 {
 		c.MaxFileBytes = defaultMaxFile
@@ -208,6 +234,8 @@ type Server struct {
 	authFail  *limiters // failed sign-ins per address
 	tenants   sync.Map  // call id -> tenant, for calls that have a room on this node
 	glocks    [64]sync.Mutex
+	typing    *limiters
+	hook      *webhook
 
 	opsOK, opsFailed, opsDenied atomic.Int64
 	auditRefused                atomic.Int64
@@ -226,6 +254,9 @@ func New(ctx context.Context, cfg Config) (*Server, error) {
 		return nil, errors.New("rtcd: at least one service API key is required")
 	}
 	cfg.defaults()
+	if cfg.EdgeSecret != "" && len(cfg.EdgeSecret) < 24 {
+		return nil, errors.New("rtcd: edge_secret must be at least 24 characters")
+	}
 	if cfg.RecordLayer != "highest" && cfg.RecordLayer != "lowest" {
 		return nil, fmt.Errorf("rtcd: record_layer %q is not highest or lowest", cfg.RecordLayer)
 	}
@@ -245,6 +276,7 @@ func New(ctx context.Context, cfg Config) (*Server, error) {
 	s.hubs = newHubs(s)
 	s.fan = newFanout(s)
 	s.authFail = newLimiters(0.5, 20)
+	s.typing = newLimiters(0.5, 3)
 	s.auth.SetRetention(2 * cfg.MaxTokenTTL)
 
 	s.Audit, err = audit.Open(ctx, audit.Config{DB: cfg.AuditDB, Dialect: cfg.Dialect, Rebind: cfg.Rebind, File: cfg.AuditFile, Queue: cfg.AuditQueue,
@@ -262,7 +294,8 @@ func New(ctx context.Context, cfg Config) (*Server, error) {
 		return nil, err
 	}
 	s.Groups, err = groups.Open(ctx, cfg.DB, groups.Options{Dialect: cfg.Dialect, Rebind: cfg.Rebind, Notifier: s,
-		ValidUser: auth.ValidName, MaxOwned: cfg.MaxOwnedGroups, MaxMembers: cfg.MaxGroupMembers, Now: cfg.Now})
+		ValidUser: auth.ValidName, MaxOwned: cfg.MaxOwnedGroups, MaxMembers: cfg.MaxGroupMembers, MaxManaged: cfg.MaxManagedMembers, Now: cfg.Now,
+		OnRemove: s.afterRemove, OnDelete: s.afterDelete})
 	if err != nil {
 		return nil, err
 	}
@@ -276,6 +309,9 @@ func New(ctx context.Context, cfg Config) (*Server, error) {
 		}
 	}
 	s.initConvs()
+	if s.hook, err = newWebhook(s, cfg.WebhookURL, cfg.WebhookSecret); err != nil {
+		return nil, err
+	}
 	var ice []webrtc.ICEServer
 	if len(cfg.STUN) > 0 {
 		ice = append(ice, webrtc.ICEServer{URLs: cfg.STUN})
@@ -296,6 +332,8 @@ func New(ctx context.Context, cfg Config) (*Server, error) {
 	s.registerOps()
 	s.registerSecurity()
 	s.registerChat()
+	s.registerKeys()
+	s.registerConvs()
 	s.registerFiles()
 	s.hubs.bind()
 	s.wg.Add(1)
@@ -313,6 +351,7 @@ func (s *Server) Close() error {
 		close(s.stop)
 	}
 	s.wg.Wait()
+	s.hook.close()
 	s.hubs.close()
 	err := s.SFU.Close()
 	if aerr := s.Audit.Close(); err == nil {
@@ -340,9 +379,11 @@ func (s *Server) background() {
 			}
 			if n%12 == 1 {
 				s.sweepFiles()
-				if s.cfg.MsgRetention > 0 {
-					_, _ = s.Chat.Prune(context.Background(), s.cfg.MsgRetention)
-				}
+				// Always: messages sent with a lifetime and conversations with a
+				// retention of their own expire whether or not the service has a global one.
+				ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+				_, _ = s.Chat.Prune(ctx, s.cfg.MsgRetention)
+				cancel()
 			}
 			if n%12 == 0 {
 				s.opLimit.sweep(now, 5*time.Minute)
@@ -361,6 +402,9 @@ func (s *Server) background() {
 
 // Mount registers the HTTP and WebSocket endpoints on app.
 func (s *Server) Mount(app *fh.App) {
+	if s.cfg.EdgeSecret != "" {
+		app.Use(s.requireEdge)
+	}
 	app.Get("/healthz", func(c fh.Ctx) error { return c.Status(200).JSON(map[string]any{"ok": true}) })
 	app.Get("/readyz", func(c fh.Ctx) error {
 		ctx, cancel := context.WithTimeout(c.Context(), 2*time.Second)
@@ -382,6 +426,9 @@ type Stats struct {
 	EventsSent, EventsDropped             int64
 	Audit                                 audit.Stats
 	AuditRefused, SlowClientsDisconnected int64
+	// WebhookSent, WebhookRetried and WebhookDropped count deliveries to the
+	// backend's webhook (dropped: given up on, or the queue was full).
+	WebhookSent, WebhookRetried, WebhookDropped int64
 }
 
 // Stats returns the node's counters.
@@ -391,7 +438,8 @@ func (s *Server) Stats() Stats {
 	return Stats{Rooms: st.Rooms, Peers: st.Peers, Connections: s.hubs.count(),
 		OpsOK: s.opsOK.Load(), OpsFailed: s.opsFailed.Load(), OpsDenied: s.opsDenied.Load(),
 		EventsSent: sent, EventsDropped: dropped, SlowClientsDisconnected: s.hubs.slowClosed.Load(),
-		Audit: s.Audit.Stats(), AuditRefused: s.auditRefused.Load()}
+		Audit: s.Audit.Stats(), AuditRefused: s.auditRefused.Load(),
+		WebhookSent: s.hook.sent.Load(), WebhookRetried: s.hook.retried.Load(), WebhookDropped: s.hook.dropped.Load()}
 }
 
 // ---------------------------------------------------------------------------
@@ -480,4 +528,19 @@ func (s *Server) left(c calls.Call, user string) {
 		return
 	}
 	s.SFU.Leave(c.ID, user)
+}
+
+// requireEdge refuses every request that does not carry the edge secret, so the service is reachable only
+// through the backend and its proxy. Health checks are exempt: they reveal nothing and orchestrators need them.
+func (s *Server) requireEdge(c fh.Ctx) error {
+	switch c.Path() {
+	case "/healthz", "/readyz":
+		return c.Next()
+	}
+	got := c.Get("X-RTC-Edge")
+	if subtle.ConstantTimeCompare([]byte(got), []byte(s.cfg.EdgeSecret)) != 1 {
+		s.auditAnon("edge", "edge_required", strings.Clone(c.IP()), "http")
+		return c.Status(403).JSON(map[string]any{"error": map[string]any{"code": "edge_required"}})
+	}
+	return c.Next()
 }

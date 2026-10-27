@@ -69,3 +69,17 @@ func IsRetryable(err error) bool {
 	m := strings.ToLower(err.Error())
 	return strings.Contains(m, "deadlock") || strings.Contains(m, "40p01") || strings.Contains(m, "40001") || strings.Contains(m, "1213") || strings.Contains(m, "database is locked")
 }
+
+// AddColumn adds a column to a table that an earlier version created without
+// it. CREATE TABLE IF NOT EXISTS leaves such a table alone, so a new column is
+// added here; a table that already has it is not an error.
+func AddColumn(ctx context.Context, db *sql.DB, table, column, def string) error {
+	_, err := db.ExecContext(ctx, "ALTER TABLE "+table+" ADD COLUMN "+column+" "+def)
+	if err != nil {
+		m := strings.ToLower(err.Error())
+		if strings.Contains(m, "duplicate column") || strings.Contains(m, "already exists") || strings.Contains(m, "42701") || strings.Contains(m, "1060") {
+			return nil
+		}
+	}
+	return err
+}

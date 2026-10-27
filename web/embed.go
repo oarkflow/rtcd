@@ -4,7 +4,7 @@ package web
 
 import "embed"
 
-// Files are e2ee-core.js, e2ee-worker.js and chat-core.js.
+// Files are e2ee-core.js, e2ee-worker.js, chat-core.js and chat-client.js.
 //
-//go:embed e2ee-core.js e2ee-worker.js chat-core.js
+//go:embed e2ee-core.js e2ee-worker.js chat-core.js chat-client.js
 var Files embed.FS

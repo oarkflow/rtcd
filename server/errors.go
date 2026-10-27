@@ -34,6 +34,20 @@ func classify(err error) (status int, code, msg string) {
 		return ae.Status, ae.Code, ae.Message
 	case errors.Is(err, calls.ErrForbidden), errors.Is(err, groups.ErrForbidden):
 		return 403, "forbidden", ""
+	case errors.Is(err, groups.ErrIDTaken):
+		return 409, "id_taken", ""
+	case errors.Is(err, chat.ErrStale):
+		return 409, "stale_epoch", ""
+	case errors.Is(err, chat.ErrRekey):
+		return 409, "rekey_required", ""
+	case errors.Is(err, chat.ErrConflict):
+		return 409, "conflict", err.Error()
+	case errors.Is(err, chat.ErrRevoked):
+		return 403, "device_revoked", ""
+	case errors.Is(err, chat.ErrWindow):
+		return 403, "too_late", err.Error()
+	case isMissingKeys(err):
+		return 409, "members_without_keys", err.Error()
 	case errors.Is(err, chat.ErrNotFound):
 		return 404, "not_found", ""
 	case errors.Is(err, chat.ErrForbidden):
@@ -87,4 +101,9 @@ func outcomeOf(status int) string {
 	default:
 		return audit.Failed
 	}
+}
+
+func isMissingKeys(err error) bool {
+	var mk *chat.MissingKeys
+	return errors.As(err, &mk)
 }
