@@ -53,13 +53,22 @@ class AwaitingKey implements Exception {
 
 /// A message as `msg.history` and `msg.new` carry it.
 class WireMessage {
-  WireMessage({required this.seq, required this.id, required this.sender, required this.body, required this.epoch, required this.deleted});
+  WireMessage({required this.seq, required this.id, required this.sender, required this.body, required this.epoch, required this.deleted, this.sentAt = ''});
   final int seq, epoch;
-  final String id, sender, body;
+  final String id, sender, body, sentAt;
   final bool deleted;
 
   factory WireMessage.fromJson(Map<String, Object?> j) => WireMessage(
-      seq: (j['seq'] as num).toInt(), id: '${j['id']}', sender: '${j['sender']}', body: '${j['body'] ?? ''}', epoch: ((j['epoch'] ?? 0) as num).toInt(), deleted: j['deleted'] == true);
+      seq: (j['seq'] as num).toInt(), id: '${j['id']}', sender: '${j['sender']}', body: '${j['body'] ?? ''}', epoch: ((j['epoch'] ?? 0) as num).toInt(), deleted: j['deleted'] == true, sentAt: '${j['sent_at'] ?? ''}');
+}
+
+/// Thrown by [ChatClient.open] when this device has not been given the key a message was sealed under (yet).
+/// Wait for an `epoch.granted` event and open it again.
+class NoKeyYet implements Exception {
+  NoKeyYet(this.epoch);
+  final int epoch;
+  @override
+  String toString() => 'NoKeyYet(epoch $epoch)';
 }
 
 class ChatClient {
@@ -220,7 +229,7 @@ class ChatClient {
       await sync(conv);
       key = await store.get(conv, m.epoch);
     }
-    if (key == null) throw StateError('no key for epoch ${m.epoch}');
+    if (key == null) throw NoKeyYet(m.epoch);
     return decryptMessage(key, conv: conv, sender: m.sender, id: m.id, body: m.body);
   }
 
