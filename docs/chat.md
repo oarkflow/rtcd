@@ -148,3 +148,19 @@ from `msg.history` when it connects. Verify the signature and a recent timestamp
 opened by both, so the formats cannot drift apart unnoticed. `web/test/live.test.js` and
 `clients/dart/test/live_test.dart` run the clients against a real `rtcd`, including one
 conversation between a Dart client and a JavaScript one.
+
+## Running rtcd where nobody can reach it
+
+An application that fronts rtcd with its own gateway should make rtcd reachable by that gateway only.
+
+1. **Do not publish rtcd's HTTP port.** On a container network leave it unpublished; elsewhere bind `listen` to a private
+   address. (An SFU's media, UDP, cannot be proxied: that port range is the one thing that has to be open.)
+2. **Set `edge_secret`** (24+ characters, from the environment). rtcd then refuses every request that does not carry it in
+   `X-RTC-Edge` (health checks excepted), whatever the network path and whatever credential comes with it: a user token or
+   even the service key is useless without it. The backend sends it on its own calls, and its proxy adds it to the traffic
+   it forwards. `client.Client.EdgeSecret` does the former.
+3. **Let the proxy carry only what clients need**, and only with a user token: the WebSocket (`/v1/ws`, or `/v1/ws/ticket`
+   then `/v1/ws?ticket=`) and the attachment routes (`/v1/files…`). The proxy should refuse any credential that is not a user
+   token (`rtcu1.…`), so a service key that leaks cannot be replayed through it, and never forward `conv.*`, `room.*`,
+   `/v1/tokens`, `/v1/audit/*` or `/v1/stats`. A client that is told a base URL with a path (`https://api.example.com/rtcd`)
+   keeps that path (the JS and Dart clients do).

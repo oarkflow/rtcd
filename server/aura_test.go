@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/oarkflow/rtcd/auth"
 	"github.com/oarkflow/rtcd/client"
 	"github.com/oarkflow/rtcd/server"
 )
@@ -555,4 +556,58 @@ func TestLeavingAGroupAUserMadeRekeysItToo(t *testing.T) {
 		t.Fatalf("epoch of a deleted group: %+v", st)
 	}
 	_ = n
+}
+
+func TestWithAnEdgeSecretTheServiceAnswersOnlyThoseWhoHoldIt(t *testing.T) {
+	const edge = "edge-secret-0123456789-abcdefghij"
+	s := start(t, func(c *server.Config) { c.EdgeSecret = edge })
+	s.acme.EdgeSecret = edge // the backend's own client carries it
+	do := func(method, path, auth, edgeHdr string) int {
+		req, _ := http.NewRequest(method, s.base+path, strings.NewReader(`{"user":"ada"}`))
+		req.Header.Set("Content-Type", "application/json")
+		if auth != "" {
+			req.Header.Set("Authorization", "Bearer "+auth)
+		}
+		if edgeHdr != "" {
+			req.Header.Set("X-RTC-Edge", edgeHdr)
+		}
+		res, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		res.Body.Close()
+		return res.StatusCode
+	}
+
+	// Health checks are open: they say nothing and orchestrators need them.
+	if c := do("GET", "/healthz", "", ""); c != 200 {
+		t.Fatalf("healthz: %d", c)
+	}
+	// Everything else needs the secret, whatever credential comes with it: a service key, a user token, none.
+	user := s.token("ada")
+	for name, auth := range map[string]string{"no credential": "", "service key": acmeKey, "user token": user} {
+		for _, p := range []string{"/v1/tokens", "/v1/stats", "/v1/conversations/open", "/v1/ws", "/v1/ws/ticket", "/v1/files", "/v1/messages", "/v1/calls"} {
+			if c := do("POST", p, auth, ""); c != 403 {
+				t.Fatalf("%s to %s without the secret: %d", name, p, c)
+			}
+			if c := do("POST", p, auth, "wrong-secret-0123456789-abcdefghij"); c != 403 {
+				t.Fatalf("%s to %s with the wrong secret: %d", name, p, c)
+			}
+		}
+	}
+	if c := do("GET", "/v1/ws?token="+user, "", ""); c != 403 {
+		t.Fatalf("a websocket without the secret: %d", c)
+	}
+	// With it, the service works as before.
+	if c := do("POST", "/v1/tokens", acmeKey, edge); c != 200 {
+		t.Fatalf("token with the secret: %d", c)
+	}
+	if c := do("POST", "/v1/ws/ticket", user, edge); c != 200 {
+		t.Fatalf("ticket with the secret: %d", c)
+	}
+	// and a secret that is too short is refused at startup
+	if _, err := server.New(bg, server.Config{DB: testDB(t, t.TempDir(), "e.db", 1), Dialect: dialect(), EdgeSecret: "short",
+		Keys: []auth.ServiceKey{{Name: "chat", Key: acmeKey, Tenant: "acme"}}, TokenSecret: "token-secret-token-secret-0123456"}); err == nil {
+		t.Fatal("started with a short edge secret")
+	}
 }

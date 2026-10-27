@@ -11,10 +11,12 @@ package server
 
 import (
 	"context"
+	"crypto/subtle"
 	"database/sql"
 	"errors"
 	"fmt"
 	"os"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -112,6 +114,12 @@ type Config struct {
 	DeleteWindow time.Duration
 	// MaxManagedMembers caps the people in one managed conversation (default 1000).
 	MaxManagedMembers int
+
+	// EdgeSecret, when set, makes rtcd answer only requests that carry it in X-RTC-Edge (health checks
+	// excepted). Set it to a value only the backend and its proxy know and rtcd stops being reachable by
+	// anyone else, whatever its network exposure and whatever credentials they hold: a user token or even a
+	// service key is useless without it. At least 24 characters.
+	EdgeSecret string
 
 	// Webhook, when set, receives a signed POST for each event the backend
 	// needs while a user may be offline (a new message to push, a rekey).
@@ -246,6 +254,9 @@ func New(ctx context.Context, cfg Config) (*Server, error) {
 		return nil, errors.New("rtcd: at least one service API key is required")
 	}
 	cfg.defaults()
+	if cfg.EdgeSecret != "" && len(cfg.EdgeSecret) < 24 {
+		return nil, errors.New("rtcd: edge_secret must be at least 24 characters")
+	}
 	if cfg.RecordLayer != "highest" && cfg.RecordLayer != "lowest" {
 		return nil, fmt.Errorf("rtcd: record_layer %q is not highest or lowest", cfg.RecordLayer)
 	}
@@ -391,6 +402,9 @@ func (s *Server) background() {
 
 // Mount registers the HTTP and WebSocket endpoints on app.
 func (s *Server) Mount(app *fh.App) {
+	if s.cfg.EdgeSecret != "" {
+		app.Use(s.requireEdge)
+	}
 	app.Get("/healthz", func(c fh.Ctx) error { return c.Status(200).JSON(map[string]any{"ok": true}) })
 	app.Get("/readyz", func(c fh.Ctx) error {
 		ctx, cancel := context.WithTimeout(c.Context(), 2*time.Second)
@@ -514,4 +528,19 @@ func (s *Server) left(c calls.Call, user string) {
 		return
 	}
 	s.SFU.Leave(c.ID, user)
+}
+
+// requireEdge refuses every request that does not carry the edge secret, so the service is reachable only
+// through the backend and its proxy. Health checks are exempt: they reveal nothing and orchestrators need them.
+func (s *Server) requireEdge(c fh.Ctx) error {
+	switch c.Path() {
+	case "/healthz", "/readyz":
+		return c.Next()
+	}
+	got := c.Get("X-RTC-Edge")
+	if subtle.ConstantTimeCompare([]byte(got), []byte(s.cfg.EdgeSecret)) != 1 {
+		s.auditAnon("edge", "edge_required", strings.Clone(c.IP()), "http")
+		return c.Status(403).JSON(map[string]any{"error": map[string]any{"code": "edge_required"}})
+	}
+	return c.Next()
 }

@@ -14,7 +14,8 @@ class RtcdException implements Exception {
   final String code;
   final String message;
   @override
-  String toString() => 'RtcdException($code${message.isEmpty ? '' : ': $message'})';
+  String toString() =>
+      'RtcdException($code${message.isEmpty ? '' : ': $message'})';
 }
 
 class RtcdEvent {
@@ -26,12 +27,16 @@ class RtcdEvent {
 
 /// Signature of the function [ChatClient] sends its requests through, so a
 /// connection can be this class, an existing socket of yours, or HTTP.
-typedef CallFn = Future<Map<String, Object?>> Function(String op, Map<String, Object?> payload);
+typedef CallFn = Future<Map<String, Object?>> Function(
+    String op, Map<String, Object?> payload);
 
 class RtcdConnection {
   RtcdConnection._(this._ch, this._http, this._base, this._token) {
-    _sub = _ch.stream.listen(_onFrame, onError: _fail, onDone: () => _fail(StateError('the connection closed')));
-    _ping = Timer.periodic(const Duration(seconds: 25), (_) => _send({'type': 'ping'}));
+    _sub = _ch.stream.listen(_onFrame,
+        onError: _fail,
+        onDone: () => _fail(StateError('the connection closed')));
+    _ping = Timer.periodic(
+        const Duration(seconds: 25), (_) => _send({'type': 'ping'}));
   }
 
   final WebSocketChannel _ch;
@@ -47,12 +52,20 @@ class RtcdConnection {
 
   /// Opens a connection for a user token the backend minted. A single-use ticket
   /// is traded for the token first, so the token never appears in a URL.
-  static Future<RtcdConnection> connect(Uri base, String token, {http.Client? client}) async {
+  static Future<RtcdConnection> connect(Uri base, String token,
+      {http.Client? client}) async {
     final h = client ?? http.Client();
-    final res = await h.post(base.resolve('/v1/ws/ticket'), headers: {'Authorization': 'Bearer $token', 'Content-Type': 'application/json'}, body: '{}');
+    final res = await h.post(apiUrl(base, '/v1/ws/ticket'),
+        headers: {
+          'Authorization': 'Bearer $token',
+          'Content-Type': 'application/json'
+        },
+        body: '{}');
     if (res.statusCode ~/ 100 != 2) throw _httpError(res);
     final ticket = (jsonDecode(res.body) as Map)['ticket'] as String;
-    final ws = base.replace(scheme: base.scheme == 'https' ? 'wss' : 'ws', path: '/v1/ws', queryParameters: {'ticket': ticket});
+    final ws = apiUrl(base, '/v1/ws').replace(
+        scheme: base.scheme == 'https' ? 'wss' : 'ws',
+        queryParameters: {'ticket': ticket});
     final ch = WebSocketChannel.connect(ws);
     await ch.ready;
     return RtcdConnection._(ch, h, base, token);
@@ -71,13 +84,20 @@ class RtcdConnection {
     final m = jsonDecode(raw as String) as Map<String, Object?>;
     switch (m['type']) {
       case 'ack':
-        _pending.remove(m['replyTo'])?.complete((m['payload'] as Map?)?.cast<String, Object?>() ?? <String, Object?>{});
+        _pending.remove(m['replyTo'])?.complete(
+            (m['payload'] as Map?)?.cast<String, Object?>() ??
+                <String, Object?>{});
       case 'error':
         final e = '${m['error'] ?? m['code']}';
         final i = e.indexOf(': ');
-        _pending.remove(m['replyTo'])?.completeError(RtcdException(i < 0 ? e : e.substring(0, i), i < 0 ? '' : e.substring(i + 2)));
+        _pending.remove(m['replyTo'])?.completeError(RtcdException(
+            i < 0 ? e : e.substring(0, i), i < 0 ? '' : e.substring(i + 2)));
       case 'emit':
-        _events.add(RtcdEvent('${m['event']}', (m['payload'] as Map?)?.cast<String, Object?>() ?? <String, Object?>{}, '${m['from'] ?? ''}'));
+        _events.add(RtcdEvent(
+            '${m['event']}',
+            (m['payload'] as Map?)?.cast<String, Object?>() ??
+                <String, Object?>{},
+            '${m['from'] ?? ''}'));
     }
   }
 
@@ -93,7 +113,8 @@ class RtcdConnection {
   }
 
   /// Sends one request and returns its answer; throws [RtcdException] on an error answer.
-  Future<Map<String, Object?>> call(String op, [Map<String, Object?> payload = const {}]) {
+  Future<Map<String, Object?>> call(String op,
+      [Map<String, Object?> payload = const {}]) {
     if (_closed.isCompleted) return Future.error(RtcdException('closed'));
     final id = (++_n).toRadixString(36);
     final c = Completer<Map<String, Object?>>();
@@ -122,6 +143,13 @@ RtcdException _httpError(http.Response r) {
     return RtcdException('http_${r.statusCode}');
   }
 }
+
+/// [path] under [base], keeping any path [base] already has. A backend that proxies the service under a prefix
+/// (`https://api.example.com/rtcd`) hands out that prefix as the base, and `Uri.resolve('/v1/…')` would drop it.
+Uri apiUrl(Uri base, String path) => base.replace(
+    path: '${base.path.replaceAll(RegExp(r'/+$'), '')}$path',
+    query: null,
+    fragment: null);
 
 /// Throws the error an HTTP answer carries.
 RtcdException httpError(http.Response r) => _httpError(r);

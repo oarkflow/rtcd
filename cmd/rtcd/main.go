@@ -118,6 +118,9 @@ type fileConfig struct {
 	FileRetention   string `json:"file_retention"`
 	MsgRetention    string `json:"message_retention"`
 	MaxMessageBytes int    `json:"max_message_bytes"`
+	// EdgeSecret makes rtcd answer only requests carrying it (header X-RTC-Edge): the backend and its proxy
+	// know it, nobody else does, so rtcd is not reachable by anyone else whatever credentials they hold.
+	EdgeSecret string `json:"edge_secret"`
 	// MaxDevices is how many active device keys one user may publish.
 	MaxDevices int `json:"max_devices_per_user"`
 	// DeleteWindow is how long a sender may delete a message for everyone.
@@ -188,6 +191,7 @@ func build(fc fileConfig) (server.Config, []*sql.DB, error) {
 	cfg.RecordDir, cfg.RecordLayer, cfg.RecordMinFree = fc.RecordDir, fc.RecordLayer, fc.RecordMinFree
 	cfg.AttachDir, cfg.MaxFileBytes, cfg.TenantFileBytes, cfg.MaxMessageBytes = fc.AttachDir, fc.MaxFileBytes, fc.TenantFileBytes, fc.MaxMessageBytes
 	cfg.NodeID = fc.NodeID
+	cfg.EdgeSecret = fc.EdgeSecret
 	cfg.MaxDevices, cfg.MaxManagedMembers = fc.MaxDevices, fc.MaxConvMembers
 	cfg.WebhookURL, cfg.WebhookSecret = fc.Webhook.URL, fc.Webhook.Secret
 	life, err := dur("database.max_lifetime", fc.Database.MaxLifetime)
