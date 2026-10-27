@@ -51,6 +51,22 @@ void main() {
     await expectLater(wrapEpochKey(me, Uint8List(65), 'c', 1, newKey()), throwsA(isA<ChatCryptoException>()));
   });
 
+  test('an identity made from a scalar is the same every time, and works like any other', () async {
+    final seed = List<int>.generate(48, (i) => (i * 5 + 1) & 255);
+    final a = await DeviceIdentity.fromScalar(seed), b = await DeviceIdentity.fromScalar(seed);
+    expect(a.publicRaw, b.publicRaw);
+    expect(a.publicRaw.length, 65);
+    expect(a.publicRaw[0], 4);
+    expect((await DeviceIdentity.fromScalar(List.filled(48, 7))).publicRaw, isNot(a.publicRaw));
+    final peer = await DeviceIdentity.generate();
+    final key = newKey();
+    final w = await wrapEpochKey(peer, a.publicRaw, 'c', 1, key);
+    expect(await unwrapEpochKey(a, peer.publicRaw, 'c', 1, w), key);
+    // the web client can open what it wraps: the public point must be on the curve (agree() checks)
+    final w2 = await wrapEpochKey(a, peer.publicRaw, 'c', 2, key);
+    expect(await unwrapEpochKey(peer, a.publicRaw, 'c', 2, w2), key);
+  });
+
   group('round trips', () {
     test('a message', () async {
       final k = newKey();

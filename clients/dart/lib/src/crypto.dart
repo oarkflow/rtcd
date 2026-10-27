@@ -108,6 +108,13 @@ class DeviceIdentity {
     return DeviceIdentity(kp.d, kp.publicRaw);
   }
 
+  /// The identity whose private scalar is [scalar] (1 to 32 bytes, reduced into range), for an app that derives
+  /// the key from a secret it already protects instead of storing another.
+  static Future<DeviceIdentity> fromScalar(List<int> scalar) async {
+    final kp = await P256.impl.fromScalar(Uint8List.fromList(scalar));
+    return DeviceIdentity(kp.d, kp.publicRaw);
+  }
+
   Map<String, Object?> toJson() => {'v': 2, 'd': b64(d), 'pub': b64(publicRaw)};
 
   static DeviceIdentity fromJson(Map<String, Object?> j) {
@@ -122,6 +129,9 @@ class DeviceIdentity {
 abstract class P256 {
   /// A new key pair: the private scalar (32 bytes) and the uncompressed public key (65 bytes).
   Future<({Uint8List d, Uint8List publicRaw})> generate();
+
+  /// The key pair for a given scalar, reduced into [1, n-1].
+  Future<({Uint8List d, Uint8List publicRaw})> fromScalar(Uint8List scalar);
 
   /// The shared secret (the 32-byte x coordinate) of our scalar and their public key.
   /// Throws [ChatCryptoException] `bad_wrap` for a key that is not a point on the curve.
@@ -152,6 +162,14 @@ class PointyP256 implements P256 {
     final pair = gen.generateKeyPair();
     final d = (pair.privateKey as pc.ECPrivateKey).d!;
     final q = (pair.publicKey as pc.ECPublicKey).Q!;
+    return (d: _bytes(d), publicRaw: Uint8List.fromList(q.getEncoded(false)));
+  }
+
+  @override
+  Future<({Uint8List d, Uint8List publicRaw})> fromScalar(Uint8List scalar) async {
+    final n = _domain.n;
+    final d = (_int(scalar) % (n - BigInt.one)) + BigInt.one;
+    final q = (_domain.G * d)!;
     return (d: _bytes(d), publicRaw: Uint8List.fromList(q.getEncoded(false)));
   }
 
