@@ -350,7 +350,9 @@ func (s *Server) registerChat() {
 // is checked again against the database first, because the answer held for a
 // couple of seconds may be from before another node changed it.
 func (s *Server) epochOK(o *opCtx, tenant, conv string, st chat.State, epoch int64) (chat.State, error) {
-	if !st.Rekey && epoch == st.Epoch {
+	// An MLS group keeps the previous epoch's secrets for a short while, so a
+	// message sealed just before a commit still opens when it lands just after.
+	if !st.Rekey && (epoch == st.Epoch || (st.MLS && epoch == st.Epoch-1 && epoch >= 0)) {
 		return st, nil
 	}
 	st, err := s.Chat.Fresh(o, tenant, conv)
@@ -360,6 +362,8 @@ func (s *Server) epochOK(o *opCtx, tenant, conv string, st chat.State, epoch int
 	switch {
 	case st.Rekey:
 		return st, &apiError{409, "rekey_required", fmt.Sprintf("someone left or a device was revoked: make epoch %d first", st.Epoch+1)}
+	case st.MLS && (epoch == st.Epoch || epoch == st.Epoch-1):
+		return st, nil // the cached answer was stale and the database agrees with the message
 	case epoch != st.Epoch:
 		return st, &apiError{409, "stale_epoch", fmt.Sprintf("the current epoch is %d", st.Epoch)}
 	}

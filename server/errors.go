@@ -36,6 +36,8 @@ func classify(err error) (status int, code, msg string) {
 		return 403, "forbidden", ""
 	case errors.Is(err, groups.ErrIDTaken):
 		return 409, "id_taken", ""
+	case errors.Is(err, chat.ErrEpochConflict):
+		return 409, "mls_epoch_conflict", err.Error() // "current_epoch=N"
 	case errors.Is(err, chat.ErrStale):
 		return 409, "stale_epoch", ""
 	case errors.Is(err, chat.ErrRekey):

@@ -55,6 +55,9 @@ type State struct {
 	// Retention removes a conversation's messages after this long (0: the
 	// service's setting applies). TTL is the lifetime given to a message that
 	// asks for none. DeleteWindow is how long a sender can delete for everyone.
+	// MLS is set when the conversation's keys are an MLS group; Epoch is then
+	// the group's epoch.
+	MLS          bool          `json:"mls,omitempty"`
 	Retention    time.Duration `json:"retention,omitempty"`
 	TTL          time.Duration `json:"default_ttl,omitempty"`
 	DeleteWindow time.Duration `json:"delete_window,omitempty"`
@@ -124,13 +127,13 @@ func (s *Store) State(ctx context.Context, tenant, conv string) (State, error) {
 
 func (s *Store) stateFresh(ctx context.Context, tenant, conv string) (State, error) {
 	var st State
-	var rekey int
+	var rekey, mls int
 	var ret, ttl, win int64
-	err := s.db.QueryRowContext(ctx, s.rebind(`SELECT epoch, rekey, retention_s, ttl_s, window_s FROM rtc_conv WHERE tenant=$1 AND conv=$2`), tenant, conv).Scan(&st.Epoch, &rekey, &ret, &ttl, &win)
+	err := s.db.QueryRowContext(ctx, s.rebind(`SELECT epoch, rekey, mls, retention_s, ttl_s, window_s FROM rtc_conv WHERE tenant=$1 AND conv=$2`), tenant, conv).Scan(&st.Epoch, &rekey, &mls, &ret, &ttl, &win)
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return State{}, err
 	}
-	st.Rekey = rekey != 0
+	st.Rekey, st.MLS = rekey != 0, mls != 0
 	st.Retention, st.TTL, st.DeleteWindow = time.Duration(ret)*time.Second, time.Duration(ttl)*time.Second, time.Duration(win)*time.Second
 	s.states.mu.Lock()
 	if len(s.states.m) > 50000 {
@@ -184,7 +187,7 @@ func (s *Store) SetPolicy(ctx context.Context, tenant, conv string, p Policy) er
 func (s *Store) NeedRekey(ctx context.Context, tenant string, convs []string) ([]string, error) {
 	var out []string
 	for _, c := range convs {
-		r, err := s.db.ExecContext(ctx, s.rebind(`UPDATE rtc_conv SET rekey=1, updated_at=$1 WHERE tenant=$2 AND conv=$3 AND epoch>0 AND rekey=0`), s.o.Now().UnixMilli(), tenant, c)
+		r, err := s.db.ExecContext(ctx, s.rebind(`UPDATE rtc_conv SET rekey=1, updated_at=$1 WHERE tenant=$2 AND conv=$3 AND (epoch>0 OR mls=1) AND rekey=0`), s.o.Now().UnixMilli(), tenant, c)
 		if err != nil {
 			return out, err
 		}
@@ -201,7 +204,7 @@ func (s *Store) WithEpochs(ctx context.Context, tenant string, convs []string) (
 	var out []string
 	for i := 0; i < len(convs); i += 200 {
 		part := convs[i:min(i+200, len(convs))]
-		q, args := inList(`SELECT conv FROM rtc_conv WHERE tenant=$1 AND epoch>0 AND conv IN (`, []any{tenant}, part)
+		q, args := inList(`SELECT conv FROM rtc_conv WHERE tenant=$1 AND (epoch>0 OR mls=1) AND conv IN (`, []any{tenant}, part)
 		rows, err := s.db.QueryContext(ctx, s.rebind(q), args...)
 		if err != nil {
 			return nil, err
@@ -496,11 +499,15 @@ func (s *Store) Rotate(ctx context.Context, tenant, conv string, next int64, by,
 		return err
 	}
 	defer tx.Rollback()
-	r, err := tx.ExecContext(ctx, s.rebind(`UPDATE rtc_conv SET epoch=$1, rekey=0, updated_at=$2 WHERE tenant=$3 AND conv=$4 AND epoch=$5`), next, s.o.Now().UnixMilli(), tenant, conv, next-1)
+	r, err := tx.ExecContext(ctx, s.rebind(`UPDATE rtc_conv SET epoch=$1, rekey=0, updated_at=$2 WHERE tenant=$3 AND conv=$4 AND epoch=$5 AND mls=0`), next, s.o.Now().UnixMilli(), tenant, conv, next-1)
 	if err != nil {
 		return err
 	}
 	if n, _ := r.RowsAffected(); n == 0 {
+		// An MLS group's epoch moves by commit only; a wrapped key cannot move it.
+		if st, serr := s.stateFresh(ctx, tenant, conv); serr == nil && st.MLS {
+			return fmt.Errorf("%w: this conversation's keys are an MLS group; publish a commit", ErrConflict)
+		}
 		return ErrStale
 	}
 	if err := s.insertWraps(ctx, tx, tenant, conv, next, by, byDevice, wraps); err != nil {
@@ -520,6 +527,9 @@ func (s *Store) Grant(ctx context.Context, tenant, conv string, epoch int64, by,
 	st, err := s.Fresh(ctx, tenant, conv)
 	if err != nil {
 		return 0, err
+	}
+	if st.MLS {
+		return 0, fmt.Errorf("%w: this conversation's keys are an MLS group; add devices with a commit", ErrConflict)
 	}
 	if epoch < 1 || epoch > st.Epoch {
 		return 0, fmt.Errorf("%w: there is no epoch %d", ErrInvalid, epoch)

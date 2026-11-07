@@ -60,6 +60,10 @@ type Options struct {
 	// MaxBody is the largest message body in bytes. Default 32 KiB.
 	MaxBody int
 	Now     func() time.Time
+	// MLSSuites are the MLS cipher suites a group may be created with
+	// (default: the three RFC 9420 suites). Add a post-quantum suite's
+	// codepoint here to allow it; remove the others to forbid them.
+	MLSSuites []int
 }
 
 // Store keeps messages in SQL.
@@ -114,6 +118,9 @@ func Open(ctx context.Context, db *sql.DB, o Options) (*Store, error) {
 		}
 	}
 	if err := s.openKeys(ctx); err != nil {
+		return nil, err
+	}
+	if err := s.openMLS(ctx); err != nil {
 		return nil, err
 	}
 	return s, nil
@@ -402,6 +409,9 @@ func (s *Store) PurgeConv(ctx context.Context, tenant, conv string) ([]string, e
 		`DELETE FROM rtc_messages WHERE tenant=$1 AND conv=$2`,
 		`DELETE FROM rtc_msg_cursor WHERE tenant=$1 AND conv=$2`,
 		`DELETE FROM rtc_epoch_keys WHERE tenant=$1 AND conv=$2`,
+		`DELETE FROM rtc_mls_hs WHERE tenant=$1 AND conv=$2`,
+		`DELETE FROM rtc_mls_removed WHERE tenant=$1 AND conv=$2`,
+		`DELETE FROM rtc_mls_group WHERE tenant=$1 AND conv=$2`,
 		`DELETE FROM rtc_conv WHERE tenant=$1 AND conv=$2`,
 	} {
 		if _, err := s.db.ExecContext(ctx, s.rebind(q), tenant, conv); err != nil {

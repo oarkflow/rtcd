@@ -277,6 +277,9 @@ func (s *Server) announceRekey(ctx context.Context, tenant, conv string) {
 func (s *Server) afterRemove(ctx context.Context, tenant, id string, users []string) {
 	s.dropConvs()
 	_ = s.Chat.DropWraps(ctx, tenant, id, users)
+	// In an MLS group the people stay in the group until a commit removes them:
+	// note who, so the fence holds until that commit names them.
+	_, _ = s.Chat.RemovedFromRoster(ctx, tenant, id, users)
 	if flagged, _ := s.Chat.NeedRekey(ctx, tenant, []string{id}); len(flagged) > 0 {
 		s.announceRekey(ctx, tenant, id)
 	}

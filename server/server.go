@@ -333,6 +333,7 @@ func New(ctx context.Context, cfg Config) (*Server, error) {
 	s.registerSecurity()
 	s.registerChat()
 	s.registerKeys()
+	s.registerMLS()
 	s.registerConvs()
 	s.registerFiles()
 	s.hubs.bind()
@@ -383,6 +384,10 @@ func (s *Server) background() {
 				// retention of their own expire whether or not the service has a global one.
 				ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 				_, _ = s.Chat.Prune(ctx, s.cfg.MsgRetention)
+				// Handshakes older than 30 days (a member offline that long rejoins
+				// from the stored GroupInfo; the newest 1000 are always kept) and
+				// expired KeyPackages.
+				_, _ = s.Chat.PruneMLS(ctx, 30*24*time.Hour, 1000)
 				cancel()
 			}
 			if n%12 == 0 {
