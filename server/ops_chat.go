@@ -183,6 +183,12 @@ func (s *Server) registerChat() {
 		if st, err = s.epochOK(o, tenant, in.Conv, st, in.Epoch); err != nil {
 			return nil, err
 		}
+		// An MLS group nobody has been added to yet has one reader, its creator:
+		// until the first commit a message to a conversation of several people
+		// would be one the others can never open.
+		if st.MLS && st.Epoch == 0 && len(ci.members) > 1 {
+			return nil, &apiError{409, "rekey_required", "add the members to the MLS group (commit epoch 1) before sending"}
+		}
 		if err := o.relayAllowed(in.Conv); err != nil {
 			return nil, err
 		}

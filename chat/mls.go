@@ -88,17 +88,23 @@ const (
 
 func (s *Store) openMLS(ctx context.Context) error {
 	key := "VARCHAR(191)"
+	// A GroupInfo carries the ratchet tree and a commit can carry a hundred
+	// welcomes' worth of proposals; MySQL's TEXT stops at 64 KB.
+	big := "TEXT"
+	if s.o.Dialect == "mysql" {
+		big = "MEDIUMTEXT"
+	}
 	for _, q := range []string{
 		`CREATE TABLE IF NOT EXISTS rtc_mls_kp (tenant ` + key + ` NOT NULL, user_id ` + key + ` NOT NULL, device ` + key + ` NOT NULL,
 			ref ` + key + ` NOT NULL, kp TEXT NOT NULL, last_resort INTEGER NOT NULL DEFAULT 0, created_at BIGINT NOT NULL, expires_at BIGINT NOT NULL,
 			PRIMARY KEY (tenant, user_id, device, ref))`,
 		`CREATE INDEX IF NOT EXISTS rtc_mls_kp_exp ON rtc_mls_kp (expires_at)`,
 		`CREATE TABLE IF NOT EXISTS rtc_mls_group (tenant ` + key + ` NOT NULL, conv ` + key + ` NOT NULL, group_id ` + key + ` NOT NULL,
-			suite INTEGER NOT NULL, seq BIGINT NOT NULL DEFAULT 0, group_info TEXT NOT NULL DEFAULT '', gi_epoch BIGINT NOT NULL DEFAULT 0,
+			suite INTEGER NOT NULL, seq BIGINT NOT NULL DEFAULT 0, group_info ` + big + ` NOT NULL, gi_epoch BIGINT NOT NULL DEFAULT 0,
 			created_at BIGINT NOT NULL, updated_at BIGINT NOT NULL, PRIMARY KEY (tenant, conv))`,
 		`CREATE UNIQUE INDEX IF NOT EXISTS rtc_mls_group_id ON rtc_mls_group (tenant, group_id)`,
 		`CREATE TABLE IF NOT EXISTS rtc_mls_hs (tenant ` + key + ` NOT NULL, conv ` + key + ` NOT NULL, seq BIGINT NOT NULL, epoch BIGINT NOT NULL,
-			kind VARCHAR(12) NOT NULL, mid ` + key + ` NOT NULL, sender ` + key + ` NOT NULL, sender_dev ` + key + ` NOT NULL, body TEXT NOT NULL,
+			kind VARCHAR(12) NOT NULL, mid ` + key + ` NOT NULL, sender ` + key + ` NOT NULL, sender_dev ` + key + ` NOT NULL, body ` + big + ` NOT NULL,
 			to_user ` + key + ` NOT NULL DEFAULT '', to_dev ` + key + ` NOT NULL DEFAULT '', created_at BIGINT NOT NULL,
 			PRIMARY KEY (tenant, conv, seq))`,
 		`CREATE INDEX IF NOT EXISTS rtc_mls_hs_age ON rtc_mls_hs (created_at)`,
@@ -144,16 +150,36 @@ type KPIn struct {
 
 // PutKeyPackages stores a device's KeyPackages and reports how many were new.
 // A device holds at most MaxKeyPackages single-use packages and one last-resort
-// package; a new last-resort package replaces the old one.
+// package; a new last-resort package replaces the old one. Publishing a package
+// the service already holds is not an error and adds nothing.
 func (s *Store) PutKeyPackages(ctx context.Context, tenant, user, device string, in []KPIn) (added int, err error) {
 	if !ValidDeviceID(device) || len(in) == 0 || len(in) > MaxPutBatch {
 		return 0, ErrInvalid
+	}
+	for _, k := range in {
+		if !validB64(k.KP, MaxKeyPackage) || k.TTL < 0 {
+			return 0, fmt.Errorf("%w: a key package is 1 to %d base64url characters", ErrInvalid, MaxKeyPackage)
+		}
 	}
 	if d, derr := s.device(ctx, tenant, user, device); derr == nil && d.Revoked {
 		return 0, ErrRevoked
 	} else if derr != nil && !errors.Is(derr, ErrNotFound) {
 		return 0, derr
 	}
+	// Two uploads of the same package at once can both pass the check below and
+	// one then collides on the key. That aborts its transaction (on PostgreSQL
+	// nothing after a failed statement can run), so the whole upload is redone,
+	// and the second time the package is already there to be seen.
+	for attempt := 0; attempt < 3; attempt++ {
+		added, err = s.putKPs(ctx, tenant, user, device, in)
+		if !dbx.IsDuplicate(err) && !dbx.IsRetryable(err) {
+			return added, err
+		}
+	}
+	return added, err
+}
+
+func (s *Store) putKPs(ctx context.Context, tenant, user, device string, in []KPIn) (int, error) {
 	now := s.o.Now().UnixMilli()
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -164,11 +190,27 @@ func (s *Store) PutKeyPackages(ctx context.Context, tenant, user, device string,
 	if err := tx.QueryRowContext(ctx, s.rebind(`SELECT COUNT(*) FROM rtc_mls_kp WHERE tenant=$1 AND user_id=$2 AND device=$3 AND last_resort=0 AND expires_at>$4`), tenant, user, device, now).Scan(&have); err != nil {
 		return 0, err
 	}
-	seen := map[string]bool{}
-	for _, k := range in {
-		if !validB64(k.KP, MaxKeyPackage) || k.TTL < 0 {
-			return 0, fmt.Errorf("%w: a key package is 1 to %d base64url characters", ErrInvalid, MaxKeyPackage)
+	held := map[string]bool{}
+	rows, err := tx.QueryContext(ctx, s.rebind(`SELECT ref FROM rtc_mls_kp WHERE tenant=$1 AND user_id=$2 AND device=$3`), tenant, user, device)
+	if err != nil {
+		return 0, err
+	}
+	for rows.Next() {
+		var ref string
+		if err := rows.Scan(&ref); err != nil {
+			rows.Close()
+			return 0, err
 		}
+		held[ref] = true
+	}
+	rows.Close()
+	added := 0
+	for _, k := range in {
+		ref := KPRef(k.KP)
+		if held[ref] {
+			continue
+		}
+		held[ref] = true
 		ttl := time.Duration(k.TTL) * time.Second
 		if ttl == 0 {
 			ttl = DefaultKPTTL
@@ -176,29 +218,18 @@ func (s *Store) PutKeyPackages(ctx context.Context, tenant, user, device string,
 		if ttl > MaxKPTTL {
 			ttl = MaxKPTTL
 		}
-		ref := KPRef(k.KP)
-		if seen[ref] {
-			continue
-		}
-		seen[ref] = true
+		lr := 0
 		if k.LastResort {
+			lr = 1
 			// One per device: the new one replaces the old.
 			if _, err := tx.ExecContext(ctx, s.rebind(`DELETE FROM rtc_mls_kp WHERE tenant=$1 AND user_id=$2 AND device=$3 AND last_resort=1`), tenant, user, device); err != nil {
 				return 0, err
 			}
 		} else if have+added >= MaxKeyPackages {
-			return added, fmt.Errorf("%w: at most %d key packages per device", ErrLimit, MaxKeyPackages)
+			return 0, fmt.Errorf("%w: at most %d key packages per device", ErrLimit, MaxKeyPackages)
 		}
-		lr := 0
-		if k.LastResort {
-			lr = 1
-		}
-		_, err := tx.ExecContext(ctx, s.rebind(`INSERT INTO rtc_mls_kp (tenant, user_id, device, ref, kp, last_resort, created_at, expires_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`),
-			tenant, user, device, ref, k.KP, lr, now, now+ttl.Milliseconds())
-		if err != nil {
-			if dbx.IsDuplicate(err) {
-				continue // the same package again
-			}
+		if _, err := tx.ExecContext(ctx, s.rebind(`INSERT INTO rtc_mls_kp (tenant, user_id, device, ref, kp, last_resort, created_at, expires_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`),
+			tenant, user, device, ref, k.KP, lr, now, now+ttl.Milliseconds()); err != nil {
 			return 0, err
 		}
 		added++
@@ -423,8 +454,8 @@ func (s *Store) CreateMLSGroup(ctx context.Context, tenant, conv, groupID string
 	if n, _ := r.RowsAffected(); n == 0 {
 		return MLSGroup{}, fmt.Errorf("%w: this conversation already has keys (an MLS group, or per-device epochs)", ErrConflict)
 	}
-	if _, err := tx.ExecContext(ctx, s.rebind(`INSERT INTO rtc_mls_group (tenant, conv, group_id, suite, group_info, gi_epoch, created_at, updated_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$7)`),
-		tenant, conv, groupID, suite, groupInfo, int64(0), now); err != nil {
+	if _, err := tx.ExecContext(ctx, s.rebind(`INSERT INTO rtc_mls_group (tenant, conv, group_id, suite, group_info, gi_epoch, created_at, updated_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`),
+		tenant, conv, groupID, suite, groupInfo, int64(0), now, now); err != nil {
 		if dbx.IsDuplicate(err) {
 			return MLSGroup{}, fmt.Errorf("%w: that group id is already in use", ErrConflict)
 		}
@@ -746,15 +777,17 @@ func (s *Store) Propose(ctx context.Context, tenant, conv, by, byDevice, id stri
 
 // Handshake is one stored handshake message as a device reads it.
 type Handshake struct {
-	Seq     int64     `json:"seq"`
-	Epoch   int64     `json:"epoch"`
-	Kind    string    `json:"kind"`
-	ID      string    `json:"id"`
-	Sender  string    `json:"sender"`
-	Device  string    `json:"sender_device"`
-	Body    string    `json:"body"`
-	Sent    time.Time `json:"sent_at"`
-	Welcome bool      `json:"-"`
+	Seq    int64     `json:"seq"`
+	Epoch  int64     `json:"epoch"`
+	Kind   string    `json:"kind"`
+	ID     string    `json:"id"`
+	Sender string    `json:"sender"`
+	Device string    `json:"sender_device"`
+	Body   string    `json:"body"`
+	Sent   time.Time `json:"sent_at"`
+	// Oversize is set, and Body left empty, when the message is too big for the
+	// transport it was asked for over; fetch it over REST.
+	Oversize bool `json:"oversize,omitempty"`
 }
 
 // Sync returns the handshake messages after `after`, oldest first, in the one

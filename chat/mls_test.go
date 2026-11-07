@@ -2,29 +2,85 @@ package chat_test
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
 	"encoding/base64"
+	"encoding/hex"
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"sync"
 	"testing"
+	"time"
 
+	_ "github.com/go-sql-driver/mysql"
+	_ "github.com/jackc/pgx/v5/stdlib"
 	"github.com/oarkflow/rtcd/chat"
+	"github.com/oarkflow/rtcd/dbx"
 	_ "modernc.org/sqlite"
 )
 
 var mbg = context.Background()
 
-func mlsStore(t testing.TB) *chat.Store {
+// The suite runs on SQLite by default; RTCD_TEST_DB=postgres or mysql runs it on
+// a real server (the defaults match the server package's tests).
+func testDialect() string {
+	switch os.Getenv("RTCD_TEST_DB") {
+	case "postgres", "mysql":
+		return os.Getenv("RTCD_TEST_DB")
+	}
+	return "sqlite"
+}
+
+func envOr(k, d string) string {
+	if v := os.Getenv(k); v != "" {
+		return v
+	}
+	return d
+}
+
+func mlsStore(t testing.TB) *chat.Store { return mlsStoreAt(t, nil) }
+
+func mlsStoreAt(t testing.TB, now func() time.Time) *chat.Store {
 	t.Helper()
-	db, err := sql.Open("sqlite", "file:"+filepath.Join(t.TempDir(), "m.db")+"?_pragma=busy_timeout(10000)&_pragma=journal_mode(WAL)")
-	if err != nil {
-		t.Fatal(err)
+	d := testDialect()
+	var db *sql.DB
+	if d == "sqlite" {
+		var err error
+		db, err = sql.Open("sqlite", "file:"+filepath.Join(t.TempDir(), "m.db")+"?_pragma=busy_timeout(10000)&_pragma=journal_mode(WAL)")
+		if err != nil {
+			t.Fatal(err)
+		}
+	} else {
+		sum := sha256.Sum256([]byte(t.TempDir()))
+		name := "c" + hex.EncodeToString(sum[:6])
+		drv, admin, user := "pgx", envOr("RTCD_PG_DSN", "postgres://postgres:pw@localhost:55432/postgres?sslmode=disable"), envOr("RTCD_PG_BASE", "postgres://postgres:pw@localhost:55432/")+name+"?sslmode=disable"
+		if d == "mysql" {
+			drv, admin, user = "mysql", envOr("RTCD_MYSQL_DSN", "root:pw@tcp(localhost:53306)/"), envOr("RTCD_MYSQL_BASE", "root:pw@tcp(localhost:53306)/")+name
+		}
+		a, err := sql.Open(drv, admin)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := a.Exec("CREATE DATABASE " + name); err != nil {
+			t.Fatalf("create database: %v", err)
+		}
+		t.Cleanup(func() {
+			if d == "postgres" {
+				_, _ = a.Exec("DROP DATABASE IF EXISTS " + name + " WITH (FORCE)")
+			} else {
+				_, _ = a.Exec("DROP DATABASE IF EXISTS " + name)
+			}
+			a.Close()
+		})
+		if db, err = sql.Open(drv, user); err != nil {
+			t.Fatal(err)
+		}
 	}
 	db.SetMaxOpenConns(8)
 	t.Cleanup(func() { db.Close() })
-	s, err := chat.Open(mbg, db, chat.Options{Dialect: "sqlite"})
+	s, err := chat.Open(mbg, db, chat.Options{Dialect: d, Rebind: dbx.Rebind(d), Now: now})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -403,5 +459,47 @@ func BenchmarkClaimAndCommitAHundredMembers(b *testing.B) {
 		if _, err := s.Commit(mbg, chat.CommitIn{Tenant: "t", Conv: conv, By: "owner", ByDevice: "d", Epoch: 1, ID: "k", Body: b64("commit"), Welcomes: ws}, members); err != nil {
 			b.Fatal(err)
 		}
+	}
+}
+
+func TestExpiredKeyPackagesAreNeverHandedOutAndAreSwept(t *testing.T) {
+	clock := time.Now().UTC()
+	s := mlsStoreAt(t, func() time.Time { return clock })
+	if _, err := s.PutKeyPackages(mbg, "t", "bob", "d", []chat.KPIn{{KP: b64("short"), TTL: 60}, {KP: b64("lr"), LastResort: true, TTL: 3600}}); err != nil {
+		t.Fatal(err)
+	}
+	clock = clock.Add(2 * time.Minute)
+	got, _, err := s.ClaimKeyPackages(mbg, "t", []string{"bob"})
+	if err != nil || len(got) != 1 || !got[0].LastResort {
+		t.Fatalf("an expired single-use package was handed out: %+v %v", got, err)
+	}
+	clock = clock.Add(2 * time.Hour)
+	got, missing, _ := s.ClaimKeyPackages(mbg, "t", []string{"bob"})
+	if len(got) != 0 || len(missing) != 1 {
+		t.Fatalf("an expired last-resort package was handed out: %+v", got)
+	}
+	if n, err := s.PruneMLS(mbg, 0, 0); err != nil || n != 2 {
+		t.Fatalf("sweep removed %d: %v", n, err)
+	}
+}
+
+func TestADeviceHoldsAtMostAHundredSingleUsePackages(t *testing.T) {
+	s := mlsStore(t)
+	var batch []chat.KPIn
+	for i := 0; i < chat.MaxKeyPackages; i++ {
+		batch = append(batch, chat.KPIn{KP: b64(fmt.Sprint("kp", i))})
+	}
+	if n, err := s.PutKeyPackages(mbg, "t", "bob", "d", batch); err != nil || n != chat.MaxKeyPackages {
+		t.Fatalf("fill: %d %v", n, err)
+	}
+	if _, err := s.PutKeyPackages(mbg, "t", "bob", "d", []chat.KPIn{{KP: b64("one-more")}}); !errors.Is(err, chat.ErrLimit) {
+		t.Fatalf("over the cap: %v", err)
+	}
+	// The last-resort package is outside the cap, and the refused upload left nothing behind.
+	if _, err := s.PutKeyPackages(mbg, "t", "bob", "d", []chat.KPIn{{KP: b64("lr"), LastResort: true}}); err != nil {
+		t.Fatal(err)
+	}
+	if av, lr, _ := s.KeyPackageCount(mbg, "t", "bob", "d"); av != chat.MaxKeyPackages || !lr {
+		t.Fatalf("count: %d %v", av, lr)
 	}
 }

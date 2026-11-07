@@ -13,14 +13,22 @@ import (
 // messages, and holds no group secret. Application messages are the ordinary
 // msg.send, sealed under the group's current epoch.
 
-// A commit that adds a hundred people carries a hundred welcomes.
-const mlsCommitBody = 10 << 20
+// A commit that adds a hundred people carries a hundred welcomes, and a
+// GroupInfo carries the ratchet tree, so both grow with the group. A WebSocket
+// frame is limited to 64 KiB (a larger one closes the connection, and raising it
+// would make every event pushed allocate a buffer that size), so a client sends
+// anything bigger with POST /v1/mls/..., which takes the full body below.
+const mlsCommitBody = 2 << 20
 
 // inlineMax is the largest commit pushed inside the mls.commit event itself.
 // A member who gets one applies it without a round trip, which is every member
 // in the usual case, and the rare one that is larger (a commit that adds many
 // people) fetches it with mls.sync.
 const inlineMax = 16 << 10
+
+// wsReplyMax is the most a reply carries over a WebSocket (the hub refuses an
+// event payload over 192 KiB, framing included).
+const wsReplyMax = 128 << 10
 
 type mlsBody struct {
 	Conv      string         `json:"conv"`
@@ -98,6 +106,16 @@ func (s *Server) registerMLS() {
 			}
 		}
 		o.note("users", len(in.Users))
+		// Single-use packages are what give a new member's keys their forward
+		// secrecy, so claiming them is limited per person claimed: a member of a
+		// group cannot burn through someone's supply (the last-resort package
+		// would be handed out in its place).
+		now := s.cfg.Now()
+		for _, u := range in.Users {
+			if !s.claimLimit.allow(o.sess.who.Tenant+"\x00"+o.sess.who.ID+"\x00"+u, now) {
+				return nil, &apiError{429, "rate_limited", "key packages for " + u + " were claimed too often"}
+			}
+		}
 		got, missing, err := s.Chat.ClaimKeyPackages(o, o.sess.who.Tenant, in.Users)
 		if got == nil {
 			got = []chat.Claimed{}
@@ -146,7 +164,20 @@ func (s *Server) registerMLS() {
 		if _, err := s.conv(o, in.Conv); err != nil {
 			return nil, err
 		}
-		return s.Chat.MLSGroup(o, o.sess.who.Tenant, in.Conv)
+		g, err := s.Chat.MLSGroup(o, o.sess.who.Tenant, in.Conv)
+		if err != nil {
+			return nil, err
+		}
+		// A socket carries replies of 128 KiB at most. A GroupInfo for a large
+		// group is bigger: say so, and the caller fetches it over REST.
+		if o.sess.transport == "ws" && len(g.GroupInfo) > wsReplyMax {
+			n := len(g.GroupInfo)
+			g.GroupInfo = ""
+			return map[string]any{"conv": g.Conv, "group_id": g.GroupID, "suite": g.Suite, "epoch": g.Epoch, "seq": g.Seq,
+				"rekey_required": g.Rekey, "pending_removals": g.Pending, "group_info_epoch": g.GroupInfoEpoch,
+				"group_info_omitted": true, "group_info_bytes": n}, nil
+		}
+		return g, nil
 	}})
 
 	// mls.commit {conv, device, epoch, id, body, welcomes, group_info, removed}:
@@ -250,6 +281,20 @@ func (s *Server) registerMLS() {
 		list, more, err := s.Chat.Sync(o, tenant, in.Conv, o.sess.who.ID, in.Device, in.After, in.Limit)
 		if err != nil {
 			return nil, err
+		}
+		if o.sess.transport == "ws" { // stop at the reply limit; "more" says to ask again
+			size := 0
+			for i := range list {
+				size += len(list[i].Body) + 200
+				if size > wsReplyMax && i > 0 {
+					list, more = list[:i], true
+					break
+				}
+			}
+			if len(list) == 1 && size > wsReplyMax {
+				list[0].Body = "" // too big for a socket: fetch this one over REST
+				list[0].Oversize = true
+			}
 		}
 		if list == nil {
 			list = []chat.Handshake{}

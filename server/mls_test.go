@@ -187,3 +187,104 @@ func TestAConversationOfTheOlderSchemeCannotBecomeMLS(t *testing.T) {
 		t.Fatalf("expected a conflict: %v", err)
 	}
 }
+
+func TestAnMLSGroupNobodyWasAddedToTakesNoMessages(t *testing.T) {
+	s := start(t, nil)
+	ada, bob := s.dial(s.acme, "ada"), s.dial(s.acme, "bob")
+	g := group(t, ada, "bob")
+	_ = bob
+	ada.must("mls.group.create", map[string]any{"conv": g, "group_id": mb64("g0"), "suite": 1}, nil)
+	if err := ada.call("msg.send", map[string]any{"conv": g, "id": "m", "body": "x", "epoch": 0}, nil); code(err) != "rekey_required" {
+		t.Fatalf("a message only its sender could read was accepted: %v", err)
+	}
+}
+
+func TestClaimingOnePersonsPackagesIsLimited(t *testing.T) {
+	s := start(t, nil)
+	ada, bob := s.dial(s.acme, "ada"), s.dial(s.acme, "bob")
+	publishKPs(t, bob, "phone")
+	g := group(t, ada, "bob")
+	var limited int
+	for i := 0; i < 12; i++ {
+		if err := ada.call("mls.kp.claim", map[string]any{"conv": g, "users": []string{"bob"}}, nil); code(err) == "rate_limited" {
+			limited++
+		} else if err != nil {
+			t.Fatal(err)
+		}
+	}
+	if limited == 0 {
+		t.Fatal("a member drained another's key packages without limit")
+	}
+}
+
+func TestALargeCommitGoesOverRESTAndASmallOneOverTheSocket(t *testing.T) {
+	s := start(t, nil)
+	ada, bob := s.dial(s.acme, "ada"), s.dial(s.acme, "bob")
+	g := group(t, ada, "bob")
+	ada.must("mls.group.create", map[string]any{"conv": g, "group_id": mb64("gbig"), "suite": 1}, nil)
+	post := func(tok, path string, v any) (int, []byte) {
+		b, _ := json.Marshal(v)
+		return s.api(tok, "POST", path, b, nil)
+	}
+	// A small commit rides the socket.
+	ada.must("mls.commit", map[string]any{"conv": g, "device": "d1", "epoch": 1, "id": "small", "body": mb64("c")}, nil)
+	// ~930 KiB of GroupInfo (a ratchet tree for a big group) goes over REST.
+	big := make([]byte, 700<<10)
+	for i := range big {
+		big[i] = byte(i * 7)
+	}
+	tok := s.token("ada")
+	if st, b := post(tok, "/v1/mls/commit", map[string]any{"conv": g, "device": "d1", "epoch": 2, "id": "big", "body": mb64("c"), "group_info": mb64(string(big)),
+		"welcomes": []map[string]any{{"user": "bob", "device": "d", "w": mb64("w")}}}); st != 200 {
+		t.Fatalf("large commit over REST: %d %.200s", st, b)
+	}
+	var ws struct {
+		Omitted bool  `json:"group_info_omitted"`
+		Bytes   int   `json:"group_info_bytes"`
+		Epoch   int64 `json:"epoch"`
+	}
+	bob.must("mls.group.get", map[string]any{"conv": g}, &ws)
+	if !ws.Omitted || ws.Bytes < 900<<10 || ws.Epoch != 2 {
+		t.Fatalf("over the socket the group info is reported, not sent: %+v", ws)
+	}
+	var gi struct {
+		GroupInfo string `json:"group_info"`
+	}
+	st, rb := post(s.token("bob"), "/v1/mls/group/get", map[string]any{"conv": g})
+	if st != 200 || json.Unmarshal(rb, &gi) != nil {
+		t.Fatalf("group get over REST: %d %.200s", st, rb)
+	}
+	if len(gi.GroupInfo) < 900<<10 {
+		t.Fatalf("group info came back as %d bytes", len(gi.GroupInfo))
+	}
+	// Over the operation's own limit: refused with a reason.
+	tooBig := mb64(string(make([]byte, 2<<20)))
+	if st, b := post(tok, "/v1/mls/commit", map[string]any{"conv": g, "device": "d1", "epoch": 3, "id": "huge", "body": tooBig}); st != 413 {
+		t.Fatalf("oversized commit: %d %.200s", st, b)
+	}
+}
+
+func TestMLSOperationsAreReachableOverREST(t *testing.T) {
+	s := start(t, nil)
+	ada, bob := s.dial(s.acme, "ada"), s.dial(s.acme, "bob")
+	g := group(t, ada, "bob")
+	_ = bob
+	tok := s.token("ada")
+	post := func(path string, v any) (int, []byte) {
+		b, _ := json.Marshal(v)
+		return s.api(tok, "POST", path, b, nil)
+	}
+	if st, b := post("/v1/mls/group/create", map[string]any{"conv": g, "group_id": mb64("rest"), "suite": 1}); st != 200 {
+		t.Fatalf("create: %d %s", st, b)
+	}
+	if st, b := post("/v1/mls/commit", map[string]any{"conv": g, "device": "d1", "epoch": 1, "id": "k", "body": mb64("c")}); st != 200 {
+		t.Fatalf("commit: %d %s", st, b)
+	}
+	st, b := post("/v1/mls/commit", map[string]any{"conv": g, "device": "d2", "epoch": 1, "id": "k2", "body": mb64("c2")})
+	if st != 409 || field(b, "error", "code") != "mls_epoch_conflict" && field(b, "code") != "mls_epoch_conflict" {
+		t.Fatalf("a lost race over REST: %d %s", st, b)
+	}
+	if st, b := post("/v1/mls/sync", map[string]any{"conv": g, "device": "d1", "after": 0}); st != 200 || field(b, "epoch") != float64(1) {
+		t.Fatalf("sync: %d %s", st, b)
+	}
+}

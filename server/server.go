@@ -220,22 +220,23 @@ type Server struct {
 	SFU    *sfu.Server
 	Audit  *audit.Log
 
-	ops       map[string]*opDef
-	opLimit   *limiters
-	rlLimit   *limiters
-	convLimit *limiters
-	limited   limitedLog
-	anonFail  *bucket // bounds the audit entries unauthenticated callers can cause
-	hubs      *hubs
-	fan       *fanout
-	convs     convCache
-	parts     sync.Map // tenant\x00file -> partEntry
-	cl        *cluster
-	authFail  *limiters // failed sign-ins per address
-	tenants   sync.Map  // call id -> tenant, for calls that have a room on this node
-	glocks    [64]sync.Mutex
-	typing    *limiters
-	hook      *webhook
+	ops        map[string]*opDef
+	opLimit    *limiters
+	rlLimit    *limiters
+	convLimit  *limiters
+	limited    limitedLog
+	anonFail   *bucket // bounds the audit entries unauthenticated callers can cause
+	hubs       *hubs
+	fan        *fanout
+	convs      convCache
+	parts      sync.Map // tenant\x00file -> partEntry
+	cl         *cluster
+	authFail   *limiters // failed sign-ins per address
+	tenants    sync.Map  // call id -> tenant, for calls that have a room on this node
+	glocks     [64]sync.Mutex
+	typing     *limiters
+	claimLimit *limiters // KeyPackage claims, per caller and person claimed
+	hook       *webhook
 
 	opsOK, opsFailed, opsDenied atomic.Int64
 	auditRefused                atomic.Int64
@@ -277,6 +278,7 @@ func New(ctx context.Context, cfg Config) (*Server, error) {
 	s.fan = newFanout(s)
 	s.authFail = newLimiters(0.5, 20)
 	s.typing = newLimiters(0.5, 3)
+	s.claimLimit = newLimiters(0.2, 5)
 	s.auth.SetRetention(2 * cfg.MaxTokenTTL)
 
 	s.Audit, err = audit.Open(ctx, audit.Config{DB: cfg.AuditDB, Dialect: cfg.Dialect, Rebind: cfg.Rebind, File: cfg.AuditFile, Queue: cfg.AuditQueue,
@@ -394,6 +396,7 @@ func (s *Server) background() {
 				s.opLimit.sweep(now, 5*time.Minute)
 				s.authFail.sweep(now, 5*time.Minute)
 				s.convLimit.sweep(now, 5*time.Minute)
+				s.claimLimit.sweep(now, 5*time.Minute)
 				s.rlLimit.sweep(now, 5*time.Minute)
 			}
 			if c := s.anonSuppressed.Swap(0); c > 0 {
