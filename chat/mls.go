@@ -560,6 +560,21 @@ type Welcome struct {
 	W      string `json:"w"`
 }
 
+// Recipient is one device a Welcome is for.
+type Recipient struct {
+	User   string `json:"user"`
+	Device string `json:"device"`
+}
+
+// SharedWelcome is one Welcome addressed to several devices. An MLS Welcome made
+// for N new members carries a secret for each of them, and every one of them
+// can use it, so adding a hundred people sends it once instead of a hundred
+// times. The service stores a copy per recipient so each reads only its own.
+type SharedWelcome struct {
+	To []Recipient `json:"to"`
+	W  string      `json:"w"`
+}
+
 // CommitIn is a commit and what goes with it.
 type CommitIn struct {
 	Tenant, Conv, By, ByDevice string
@@ -571,6 +586,9 @@ type CommitIn struct {
 	ID       string
 	Body     string
 	Welcomes []Welcome
+	// Shared are welcomes addressed to several devices at once; they are
+	// expanded to one per device and count with Welcomes against the limits.
+	Shared []SharedWelcome
 	// GroupInfo, if set, becomes the stored GroupInfo for the new epoch.
 	GroupInfo string
 	// Removed are the people this commit removes from the group.
@@ -602,6 +620,17 @@ func (s *Store) Commit(ctx context.Context, in CommitIn, members []string) (Comm
 	} else if err != nil && !errors.Is(err, ErrNotFound) {
 		return CommitOut{}, err
 	}
+	for _, sw := range in.Shared {
+		if len(sw.To) == 0 {
+			return CommitOut{}, fmt.Errorf("%w: a shared welcome names who it is for", ErrInvalid)
+		}
+		for _, r := range sw.To {
+			in.Welcomes = append(in.Welcomes, Welcome{User: r.User, Device: r.Device, W: sw.W})
+			if len(in.Welcomes) > MaxWelcomes {
+				return CommitOut{}, fmt.Errorf("%w: at most %d welcomes in a commit", ErrInvalid, MaxWelcomes)
+			}
+		}
+	}
 	isMember := make(map[string]bool, len(members))
 	for _, m := range members {
 		isMember[m] = true
@@ -619,7 +648,7 @@ func (s *Store) Commit(ctx context.Context, in CommitIn, members []string) (Comm
 		seenW[k] = true
 		total += len(w.W)
 	}
-	if total > 8<<20 {
+	if total > 16<<20 { // what is written, after a shared welcome is expanded
 		return CommitOut{}, ErrInvalid
 	}
 	for _, u := range in.Removed {

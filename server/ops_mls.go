@@ -31,14 +31,16 @@ const inlineMax = 16 << 10
 const wsReplyMax = 128 << 10
 
 type mlsBody struct {
-	Conv      string         `json:"conv"`
-	Device    string         `json:"device"`
-	Epoch     int64          `json:"epoch"`
-	ID        string         `json:"id"`
-	Body      string         `json:"body"`
-	Welcomes  []chat.Welcome `json:"welcomes"`
-	GroupInfo string         `json:"group_info"`
-	Removed   []string       `json:"removed"`
+	Conv     string         `json:"conv"`
+	Device   string         `json:"device"`
+	Epoch    int64          `json:"epoch"`
+	ID       string         `json:"id"`
+	Body     string         `json:"body"`
+	Welcomes []chat.Welcome `json:"welcomes"`
+	// Shared are welcomes each addressed to several devices: [{to:[{user,device}], w}].
+	Shared    []chat.SharedWelcome `json:"shared_welcomes"`
+	GroupInfo string               `json:"group_info"`
+	Removed   []string             `json:"removed"`
 }
 
 func (s *Server) registerMLS() {
@@ -200,7 +202,7 @@ func (s *Server) registerMLS() {
 		o.note("epoch", in.Epoch)
 		o.note("welcomes", len(in.Welcomes))
 		out, err := s.Chat.Commit(o, chat.CommitIn{Tenant: tenant, Conv: in.Conv, By: me, ByDevice: in.Device, Epoch: in.Epoch, ID: in.ID,
-			Body: in.Body, Welcomes: in.Welcomes, GroupInfo: in.GroupInfo, Removed: in.Removed}, ci.members)
+			Body: in.Body, Welcomes: in.Welcomes, Shared: in.Shared, GroupInfo: in.GroupInfo, Removed: in.Removed}, ci.members)
 		if err != nil {
 			return nil, err
 		}

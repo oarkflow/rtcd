@@ -503,3 +503,35 @@ func TestADeviceHoldsAtMostAHundredSingleUsePackages(t *testing.T) {
 		t.Fatalf("count: %d %v", av, lr)
 	}
 }
+
+func TestOneWelcomeCanBeAddressedToSeveralDevices(t *testing.T) {
+	s := mlsStore(t)
+	newGroup(t, s, "c")
+	members := []string{"ada", "bob", "cy"}
+	shared := b64("one welcome for three devices")
+	out, err := s.Commit(mbg, chat.CommitIn{Tenant: "t", Conv: "c", By: "ada", ByDevice: "d1", Epoch: 1, ID: "k", Body: b64("commit"),
+		Shared: []chat.SharedWelcome{{To: []chat.Recipient{{User: "bob", Device: "phone"}, {User: "bob", Device: "laptop"}, {User: "cy", Device: "d1"}}, W: shared}}}, members)
+	if err != nil || len(out.Welcomed) != 3 {
+		t.Fatalf("commit: %+v %v", out, err)
+	}
+	for _, who := range [][2]string{{"bob", "phone"}, {"bob", "laptop"}, {"cy", "d1"}} {
+		hs, _, _ := s.Sync(mbg, "t", "c", who[0], who[1], 0, 10)
+		if len(hs) != 2 || hs[1].Kind != chat.KindWelcome || hs[1].Body != shared {
+			t.Fatalf("%v: %+v", who, hs)
+		}
+	}
+	if hs, _, _ := s.Sync(mbg, "t", "c", "bob", "tablet", 0, 10); len(hs) != 1 {
+		t.Fatalf("a device that was not named got a welcome: %+v", hs)
+	}
+	// A device named twice (once shared, once alone) is a mistake, not two welcomes.
+	_, err = s.Commit(mbg, chat.CommitIn{Tenant: "t", Conv: "c", By: "ada", ByDevice: "d1", Epoch: 2, ID: "k2", Body: b64("c2"),
+		Welcomes: []chat.Welcome{{User: "bob", Device: "phone", W: shared}},
+		Shared:   []chat.SharedWelcome{{To: []chat.Recipient{{User: "bob", Device: "phone"}}, W: shared}}}, members)
+	if !errors.Is(err, chat.ErrInvalid) {
+		t.Fatalf("a device twice: %v", err)
+	}
+	if _, err := s.Commit(mbg, chat.CommitIn{Tenant: "t", Conv: "c", By: "ada", ByDevice: "d1", Epoch: 2, ID: "k3", Body: b64("c3"),
+		Shared: []chat.SharedWelcome{{W: shared}}}, members); !errors.Is(err, chat.ErrInvalid) {
+		t.Fatalf("a shared welcome for nobody: %v", err)
+	}
+}
