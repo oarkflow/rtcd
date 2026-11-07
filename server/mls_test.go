@@ -288,3 +288,20 @@ func TestMLSOperationsAreReachableOverREST(t *testing.T) {
 		t.Fatalf("sync: %d %s", st, b)
 	}
 }
+
+func TestMessagesAreReachableOverREST(t *testing.T) {
+	s := start(t, nil)
+	ada, bob := s.dial(s.acme, "ada"), s.dial(s.acme, "bob")
+	g := group(t, ada, "bob")
+	_ = bob
+	tok := s.token("ada")
+	send, _ := json.Marshal(map[string]any{"conv": g, "id": "r1", "body": "ciphertext"})
+	if st, b := s.api(tok, "POST", "/v1/msg/send", send, nil); st != 200 || field(b, "seq") != float64(1) {
+		t.Fatalf("send: %d %s", st, b)
+	}
+	hist, _ := json.Marshal(map[string]any{"conv": g, "after": 0})
+	st, b := s.api(tok, "POST", "/v1/msg/history", hist, nil)
+	if st != 200 || field(b, "messages") == nil {
+		t.Fatalf("history: %d %s", st, b)
+	}
+}

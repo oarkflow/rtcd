@@ -7,7 +7,7 @@ A conversation is either on per-device epochs (`epoch.*`, see chat.md) or on MLS
 
 ## Operations
 
-All are also `POST /v1/mls/<op with / for .>` (e.g. `mls.kp.put` -> `/v1/mls/kp/put`).
+All are also `POST /v1/mls/<op with / for .>` (and the message operations `msg.send`, `msg.history`, ... are `POST /v1/msg/send`, `/v1/msg/history`, ...) (e.g. `mls.kp.put` -> `/v1/mls/kp/put`).
 A WebSocket frame is limited to 64 KiB and a WebSocket reply to 128 KiB: send anything larger
 (a GroupInfo with the ratchet tree, a commit with many welcomes) over REST.
 
