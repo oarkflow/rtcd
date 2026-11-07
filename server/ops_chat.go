@@ -183,6 +183,12 @@ func (s *Server) registerChat() {
 		if st, err = s.epochOK(o, tenant, in.Conv, st, in.Epoch); err != nil {
 			return nil, err
 		}
+		// An MLS group nobody has been added to yet has one reader, its creator:
+		// until the first commit a message to a conversation of several people
+		// would be one the others can never open.
+		if st.MLS && st.Epoch == 0 && len(ci.members) > 1 {
+			return nil, &apiError{409, "rekey_required", "add the members to the MLS group (commit epoch 1) before sending"}
+		}
 		if err := o.relayAllowed(in.Conv); err != nil {
 			return nil, err
 		}
@@ -350,7 +356,9 @@ func (s *Server) registerChat() {
 // is checked again against the database first, because the answer held for a
 // couple of seconds may be from before another node changed it.
 func (s *Server) epochOK(o *opCtx, tenant, conv string, st chat.State, epoch int64) (chat.State, error) {
-	if !st.Rekey && epoch == st.Epoch {
+	// An MLS group keeps the previous epoch's secrets for a short while, so a
+	// message sealed just before a commit still opens when it lands just after.
+	if !st.Rekey && (epoch == st.Epoch || (st.MLS && epoch == st.Epoch-1 && epoch >= 0)) {
 		return st, nil
 	}
 	st, err := s.Chat.Fresh(o, tenant, conv)
@@ -360,6 +368,8 @@ func (s *Server) epochOK(o *opCtx, tenant, conv string, st chat.State, epoch int
 	switch {
 	case st.Rekey:
 		return st, &apiError{409, "rekey_required", fmt.Sprintf("someone left or a device was revoked: make epoch %d first", st.Epoch+1)}
+	case st.MLS && (epoch == st.Epoch || epoch == st.Epoch-1):
+		return st, nil // the cached answer was stale and the database agrees with the message
 	case epoch != st.Epoch:
 		return st, &apiError{409, "stale_epoch", fmt.Sprintf("the current epoch is %d", st.Epoch)}
 	}

@@ -155,7 +155,9 @@ func (c *Conn) fail(err error) {
 		c.mu.Unlock()
 		_ = c.ws.Close()
 		close(c.done)
-		close(c.events)
+		// c.events is closed by read, which is the only sender. Closing it here
+		// raced a read that was delivering an event at that moment ("send on
+		// closed channel"). Closing the socket above makes read return.
 	})
 }
 
@@ -170,6 +172,7 @@ type wireIn struct {
 }
 
 func (c *Conn) read() {
+	defer close(c.events)
 	for {
 		var msg string
 		if err := websocket.Message.Receive(c.ws, &msg); err != nil {
@@ -289,7 +292,7 @@ func statusOf(code string) int {
 		return 410
 	case "rate_limited", "room_full", "limit_reached", "too_many_connections":
 		return 429
-	case "stale_epoch", "rekey_required", "conflict", "id_taken", "members_without_keys":
+	case "stale_epoch", "rekey_required", "conflict", "id_taken", "members_without_keys", "mls_epoch_conflict":
 		return 409
 	case "call_not_active", "negotiating", "not_in_room", "answer_the_call_first", "already_recording",
 		"not_recording", "recording_unavailable_e2ee", "no_offer_outstanding":

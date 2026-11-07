@@ -118,6 +118,10 @@ type fileConfig struct {
 	FileRetention   string `json:"file_retention"`
 	MsgRetention    string `json:"message_retention"`
 	MaxMessageBytes int    `json:"max_message_bytes"`
+	// MLSSuites are the MLS cipher suites a group may be created with. Default
+	// [1, 79]: classical and post-quantum hybrid. [79] makes the deployment
+	// post-quantum only.
+	MLSSuites []int `json:"mls_suites"`
 	// EdgeSecret makes rtcd answer only requests carrying it (header X-RTC-Edge): the backend and its proxy
 	// know it, nobody else does, so rtcd is not reachable by anyone else whatever credentials they hold.
 	EdgeSecret string `json:"edge_secret"`
@@ -190,6 +194,7 @@ func build(fc fileConfig) (server.Config, []*sql.DB, error) {
 	cfg.LastNVideo, cfg.LastNAudio, cfg.MaxRoomMembers = fc.LastNVideo, fc.LastNAudio, fc.MaxRoomMembers
 	cfg.RecordDir, cfg.RecordLayer, cfg.RecordMinFree = fc.RecordDir, fc.RecordLayer, fc.RecordMinFree
 	cfg.AttachDir, cfg.MaxFileBytes, cfg.TenantFileBytes, cfg.MaxMessageBytes = fc.AttachDir, fc.MaxFileBytes, fc.TenantFileBytes, fc.MaxMessageBytes
+	cfg.MLSSuites = fc.MLSSuites
 	cfg.NodeID = fc.NodeID
 	cfg.EdgeSecret = fc.EdgeSecret
 	cfg.MaxDevices, cfg.MaxManagedMembers = fc.MaxDevices, fc.MaxConvMembers

@@ -45,6 +45,12 @@ func routes() []route {
 	for _, a := range []string{"get", "missing", "rotate", "grant"} {
 		r = append(r, route{"POST", "/v1/epochs/" + a, "epoch." + a, ""})
 	}
+	for _, a := range []string{"send", "history", "read", "delete", "cursors", "summary"} {
+		r = append(r, route{"POST", "/v1/msg/" + a, "msg." + a, ""})
+	}
+	for _, a := range []string{"kp/put", "kp/count", "kp/claim", "group/create", "group/get", "commit", "propose", "sync", "groupinfo/put", "sealed/set"} {
+		r = append(r, route{"POST", "/v1/mls/" + a, "mls." + strings.ReplaceAll(a, "/", "."), ""})
+	}
 	for _, a := range []string{"answer", "decline", "end", "invite", "signal", "e2ee"} {
 		r = append(r, route{"POST", "/v1/calls/:id/" + a, "call." + a, "call"})
 	}
