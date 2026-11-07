@@ -190,3 +190,16 @@ func TestTheOpenEndpointIsRateLimitedPerAddressAndSizeLimited(t *testing.T) {
 		t.Fatalf("oversized: %d", st)
 	}
 }
+
+func TestEveryMLSOperationIsReachableOverREST(t *testing.T) {
+	s := start(t, nil)
+	// A route that is missing answers 404 before authentication is even asked; a present one
+	// answers 400 or 403 to an empty body. So 404 is the only wrong answer.
+	for _, op := range []string{"mls/kp/put", "mls/kp/count", "mls/kp/claim", "mls/group/create", "mls/group/get", "mls/commit",
+		"mls/propose", "mls/sync", "mls/groupinfo/put", "mls/sealed/set", "msg/send", "msg/history"} {
+		st, _ := s.api(s.token("ada"), "POST", "/v1/"+op, []byte(`{}`), nil)
+		if st == 404 {
+			t.Errorf("/v1/%s has no REST route", op)
+		}
+	}
+}

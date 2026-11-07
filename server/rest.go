@@ -48,7 +48,7 @@ func routes() []route {
 	for _, a := range []string{"send", "history", "read", "delete", "cursors", "summary"} {
 		r = append(r, route{"POST", "/v1/msg/" + a, "msg." + a, ""})
 	}
-	for _, a := range []string{"kp/put", "kp/count", "kp/claim", "group/create", "group/get", "commit", "propose", "sync", "groupinfo/put"} {
+	for _, a := range []string{"kp/put", "kp/count", "kp/claim", "group/create", "group/get", "commit", "propose", "sync", "groupinfo/put", "sealed/set"} {
 		r = append(r, route{"POST", "/v1/mls/" + a, "mls." + strings.ReplaceAll(a, "/", "."), ""})
 	}
 	for _, a := range []string{"answer", "decline", "end", "invite", "signal", "e2ee"} {
