@@ -46,8 +46,26 @@ func (s *Server) mountSealed(app *fh.App) {
 	app.Options("/v1/sealed/send", s.preflight)
 }
 
+// sealedClientIP is the address to rate-limit a sealed send by. Behind the
+// gateway every request arrives from the gateway, which would put every sender
+// in one bucket. When rtcd requires the edge secret, a request that got this
+// far was sent by our gateway, which clears whatever forwarding header a client
+// supplied and sets its own, so the last entry is the real address. Without an
+// edge secret anyone can set that header, so it is not believed.
+func (s *Server) sealedClientIP(c fh.Ctx) string {
+	if s.cfg.EdgeSecret != "" {
+		if f := c.Get("X-Forwarded-For"); f != "" {
+			parts := strings.Split(f, ",")
+			if last := strings.TrimSpace(parts[len(parts)-1]); last != "" {
+				return strings.Clone(last)
+			}
+		}
+	}
+	return strings.Clone(c.IP())
+}
+
 func (s *Server) sealedSend(c fh.Ctx) error {
-	ip := strings.Clone(c.IP())
+	ip := s.sealedClientIP(c)
 	now := s.cfg.Now()
 	// Per address first, before any work: this endpoint is open to the world.
 	if !s.sealedIP.allow(ip, now) {
