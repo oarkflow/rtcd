@@ -107,6 +107,8 @@ type Config struct {
 	FileRetention   time.Duration
 	MsgRetention    time.Duration
 	MaxMessageBytes int
+	// MLSSuites are the MLS cipher suites a group may be created with (default 1, 2, 3 and 79).
+	MLSSuites []int
 	// MaxDevices caps the active device keys one user may publish (default 32).
 	MaxDevices int
 	// DeleteWindow is how long a sender may delete a message for everyone (0:
@@ -236,6 +238,7 @@ type Server struct {
 	glocks     [64]sync.Mutex
 	typing     *limiters
 	claimLimit *limiters // KeyPackage claims, per caller and person claimed
+	sealedIP   *limiters // sealed sends, per address: the endpoint is open to the world
 	hook       *webhook
 
 	opsOK, opsFailed, opsDenied atomic.Int64
@@ -279,6 +282,7 @@ func New(ctx context.Context, cfg Config) (*Server, error) {
 	s.authFail = newLimiters(0.5, 20)
 	s.typing = newLimiters(0.5, 3)
 	s.claimLimit = newLimiters(0.2, 5)
+	s.sealedIP = newLimiters(20, 60)
 	s.auth.SetRetention(2 * cfg.MaxTokenTTL)
 
 	s.Audit, err = audit.Open(ctx, audit.Config{DB: cfg.AuditDB, Dialect: cfg.Dialect, Rebind: cfg.Rebind, File: cfg.AuditFile, Queue: cfg.AuditQueue,
@@ -301,7 +305,7 @@ func New(ctx context.Context, cfg Config) (*Server, error) {
 	if err != nil {
 		return nil, err
 	}
-	s.Chat, err = chat.Open(ctx, cfg.DB, chat.Options{Dialect: cfg.Dialect, Rebind: cfg.Rebind, MaxBody: cfg.MaxMessageBytes, Now: cfg.Now})
+	s.Chat, err = chat.Open(ctx, cfg.DB, chat.Options{Dialect: cfg.Dialect, Rebind: cfg.Rebind, MaxBody: cfg.MaxMessageBytes, Now: cfg.Now, MLSSuites: cfg.MLSSuites})
 	if err != nil {
 		return nil, err
 	}
@@ -397,6 +401,7 @@ func (s *Server) background() {
 				s.authFail.sweep(now, 5*time.Minute)
 				s.convLimit.sweep(now, 5*time.Minute)
 				s.claimLimit.sweep(now, 5*time.Minute)
+				s.sealedIP.sweep(now, 5*time.Minute)
 				s.rlLimit.sweep(now, 5*time.Minute)
 			}
 			if c := s.anonSuppressed.Swap(0); c > 0 {
@@ -425,6 +430,7 @@ func (s *Server) Mount(app *fh.App) {
 	app.Get("/v1/ws", s.upgrade)
 	s.mountREST(app)
 	s.mountFiles(app)
+	s.mountSealed(app)
 }
 
 // Stats are what this node is carrying.

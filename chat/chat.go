@@ -410,6 +410,8 @@ func (s *Store) PurgeConv(ctx context.Context, tenant, conv string) ([]string, e
 		`DELETE FROM rtc_msg_cursor WHERE tenant=$1 AND conv=$2`,
 		`DELETE FROM rtc_epoch_keys WHERE tenant=$1 AND conv=$2`,
 		`DELETE FROM rtc_mls_hs WHERE tenant=$1 AND conv=$2`,
+		`DELETE FROM rtc_mls_wto WHERE tenant=$1 AND conv=$2`,
+		`DELETE FROM rtc_mls_sealed WHERE tenant=$1 AND conv=$2`,
 		`DELETE FROM rtc_mls_removed WHERE tenant=$1 AND conv=$2`,
 		`DELETE FROM rtc_mls_group WHERE tenant=$1 AND conv=$2`,
 		`DELETE FROM rtc_conv WHERE tenant=$1 AND conv=$2`,

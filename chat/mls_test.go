@@ -43,6 +43,16 @@ func envOr(k, d string) string {
 func mlsStore(t testing.TB) *chat.Store { return mlsStoreAt(t, nil) }
 
 func mlsStoreAt(t testing.TB, now func() time.Time) *chat.Store {
+	s, _ := mlsStoreDBAt(t, now)
+	return s
+}
+
+func mlsStoreDB(t testing.TB) *sql.DB {
+	_, db := mlsStoreDBAt(t, nil)
+	return db
+}
+
+func mlsStoreDBAt(t testing.TB, now func() time.Time) (*chat.Store, *sql.DB) {
 	t.Helper()
 	d := testDialect()
 	var db *sql.DB
@@ -84,7 +94,7 @@ func mlsStoreAt(t testing.TB, now func() time.Time) *chat.Store {
 	if err != nil {
 		t.Fatal(err)
 	}
-	return s
+	return s, db
 }
 
 // b64 makes an opaque payload; the service never decodes beyond checking it is base64url.
@@ -230,7 +240,7 @@ func TestWelcomesTravelWithTheCommitAndReachOnlyTheirDevice(t *testing.T) {
 	out, err := s.Commit(mbg, chat.CommitIn{Tenant: "t", Conv: "c", By: "ada", ByDevice: "d1", Epoch: 1, ID: "k", Body: b64("commit"),
 		GroupInfo: b64("groupinfo-1"),
 		Welcomes:  []chat.Welcome{{User: "bob", Device: "phone", W: b64("w-bob-phone")}, {User: "bob", Device: "laptop", W: b64("w-bob-laptop")}, {User: "cy", Device: "d1", W: b64("w-cy")}}}, members)
-	if err != nil || out.Seq != 1 || len(out.Welcomed) != 3 {
+	if err != nil || out.Seq != 1 || len(out.Welcomed) != 2 {
 		t.Fatalf("commit: %+v %v", out, err)
 	}
 	g, _ := s.MLSGroup(mbg, "t", "c")
@@ -511,7 +521,7 @@ func TestOneWelcomeCanBeAddressedToSeveralDevices(t *testing.T) {
 	shared := b64("one welcome for three devices")
 	out, err := s.Commit(mbg, chat.CommitIn{Tenant: "t", Conv: "c", By: "ada", ByDevice: "d1", Epoch: 1, ID: "k", Body: b64("commit"),
 		Shared: []chat.SharedWelcome{{To: []chat.Recipient{{User: "bob", Device: "phone"}, {User: "bob", Device: "laptop"}, {User: "cy", Device: "d1"}}, W: shared}}}, members)
-	if err != nil || len(out.Welcomed) != 3 {
+	if err != nil || len(out.Welcomed) != 2 {
 		t.Fatalf("commit: %+v %v", out, err)
 	}
 	for _, who := range [][2]string{{"bob", "phone"}, {"bob", "laptop"}, {"cy", "d1"}} {
@@ -533,5 +543,73 @@ func TestOneWelcomeCanBeAddressedToSeveralDevices(t *testing.T) {
 	if _, err := s.Commit(mbg, chat.CommitIn{Tenant: "t", Conv: "c", By: "ada", ByDevice: "d1", Epoch: 2, ID: "k3", Body: b64("c3"),
 		Shared: []chat.SharedWelcome{{W: shared}}}, members); !errors.Is(err, chat.ErrInvalid) {
 		t.Fatalf("a shared welcome for nobody: %v", err)
+	}
+}
+
+func TestAGroupCanBeCreatedWithThePostQuantumSuiteAndADeploymentCanRequireIt(t *testing.T) {
+	s := mlsStore(t)
+	if _, err := s.CreateMLSGroup(mbg, "t", "pq", b64("gpq"), chat.SuiteHybridPQ, ""); err != nil {
+		t.Fatalf("hybrid suite: %v", err)
+	}
+	if g, _ := s.MLSGroup(mbg, "t", "pq"); g.Suite != 0x004F {
+		t.Fatalf("suite recorded as %#x", g.Suite)
+	}
+	// A deployment configured post-quantum only refuses a classical group.
+	db := mlsStoreDB(t)
+	only, err := chat.Open(mbg, db, chat.Options{Dialect: testDialect(), Rebind: dbx.Rebind(testDialect()), MLSSuites: []int{chat.SuiteHybridPQ}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := only.CreateMLSGroup(mbg, "t", "c1", b64("g1"), 1, ""); !errors.Is(err, chat.ErrInvalid) {
+		t.Fatalf("a classical group on a post-quantum-only deployment: %v", err)
+	}
+	if _, err := only.CreateMLSGroup(mbg, "t", "c2", b64("g2"), chat.SuiteHybridPQ, ""); err != nil {
+		t.Fatalf("hybrid on a post-quantum-only deployment: %v", err)
+	}
+}
+
+func TestALargeWelcomeForManyDevicesIsStoredOnce(t *testing.T) {
+	s, db := mlsStoreDBAt(t, nil)
+	newGroup(t, s, "c")
+	members := []string{"ada"}
+	var to []chat.Recipient
+	for i := 0; i < 50; i++ {
+		u := fmt.Sprint("u", i)
+		members = append(members, u)
+		to = append(to, chat.Recipient{User: u, Device: "d"})
+	}
+	// ~700 KB of base64: the size of a welcome carrying the tree of a few hundred post-quantum members.
+	big := make([]byte, 500<<10)
+	for i := range big {
+		big[i] = byte(i * 13)
+	}
+	w := b64(string(big))
+	if _, err := s.Commit(mbg, chat.CommitIn{Tenant: "t", Conv: "c", By: "ada", ByDevice: "d1", Epoch: 1, ID: "k", Body: b64("commit"),
+		Shared: []chat.SharedWelcome{{To: to, W: w}}}, members); err != nil {
+		t.Fatal(err)
+	}
+	var copies, recipients int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM rtc_mls_hs WHERE kind='welcome'`).Scan(&copies); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.QueryRow(`SELECT COUNT(*) FROM rtc_mls_wto`).Scan(&recipients); err != nil {
+		t.Fatal(err)
+	}
+	if copies != 1 || recipients != 50 {
+		t.Fatalf("the welcome should be stored once for 50 recipients: %d copies, %d recipients", copies, recipients)
+	}
+	hs, _, _ := s.Sync(mbg, "t", "c", "u7", "d", 0, 10)
+	if len(hs) != 2 || hs[1].Body != w {
+		t.Fatalf("u7 did not get the welcome: %d messages", len(hs))
+	}
+	// A person removed from the roster loses their welcome; with all gone, the body goes too.
+	for _, u := range members[1:] {
+		if _, err := s.RemovedFromRoster(mbg, "t", "c", []string{u}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	_ = db.QueryRow(`SELECT COUNT(*) FROM rtc_mls_hs WHERE kind='welcome'`).Scan(&copies)
+	if copies != 0 {
+		t.Fatalf("a welcome nobody can read was kept: %d", copies)
 	}
 }

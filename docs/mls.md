@@ -65,3 +65,29 @@ rejoins by external commit from the stored GroupInfo. Expired KeyPackages are sw
 
 `rtc_mls_kp`, `rtc_mls_group`, `rtc_mls_hs`, `rtc_mls_removed`, and `rtc_conv.mls`. The group's epoch
 is `rtc_conv.epoch`. SQLite, PostgreSQL and MySQL; MySQL uses MEDIUMTEXT for payloads.
+
+## Post-quantum suite
+
+A group is created with one cipher suite and never changes it. Allowed by default: 1, 2, 3 and
+79 (`0x004F`, `MLS_128_MLKEM768X25519_AES128GCM_SHA256_Ed25519`: ML-KEM-768 and X25519 together, so
+the group stays safe if either is broken; signatures stay Ed25519). Set `mls_suites [79]` in
+`rtcd.bcl` to make a deployment post-quantum only. A post-quantum key package is ~2.7 KB and a
+Welcome grows with the group (it carries the ratchet tree), so `MaxWelcome` is 1 MiB and a Welcome
+for several devices is stored once.
+
+## Sealed send (sender-anonymous messages)
+
+`mls.sealed.set {conv, epoch, verifier}` (or `sealed_verifier` on `mls.commit`) stores the SHA-256
+(hex) of the epoch's **group send token**: a 32-byte secret every member derives from the MLS
+exporter (label `aura/rtcd/sealed/v1`, context the conversation id) and the service never sees.
+
+`POST /v1/sealed/send {tenant, conv, id, body, epoch, token}` needs **no sign-in**. The service
+checks `SHA-256(token)` against the verifier for the current or previous epoch, stores the message
+with sender `~sealed`, and tells every member (`msg.new`, `from` empty). It learns that someone in
+the group spoke, not who; the sender is authenticated inside the MLS message, to the members.
+
+- Every failure (unknown conversation, not MLS, wrong epoch, wrong token) is the same `403`.
+- The token changes with the epoch, so a removed member's token stops working with the commit that
+  removes them. The removal fence applies (`409 rekey_required`).
+- Rate limited per address and per conversation; body limited.
+- Not hidden: the sender's network address (use a proxy), and the roster.

@@ -155,7 +155,9 @@ func (c *Conn) fail(err error) {
 		c.mu.Unlock()
 		_ = c.ws.Close()
 		close(c.done)
-		close(c.events)
+		// c.events is closed by read, which is the only sender. Closing it here
+		// raced a read that was delivering an event at that moment ("send on
+		// closed channel"). Closing the socket above makes read return.
 	})
 }
 
@@ -170,6 +172,7 @@ type wireIn struct {
 }
 
 func (c *Conn) read() {
+	defer close(c.events)
 	for {
 		var msg string
 		if err := websocket.Message.Receive(c.ws, &msg); err != nil {

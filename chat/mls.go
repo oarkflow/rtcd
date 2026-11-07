@@ -3,6 +3,7 @@ package chat
 import (
 	"context"
 	"crypto/sha256"
+	"crypto/subtle"
 	"database/sql"
 	"encoding/base64"
 	"encoding/hex"
@@ -68,7 +69,7 @@ const (
 	MaxPutBatch      = 100
 	MaxGroupID       = 128
 	MaxCommit        = 256 << 10
-	MaxWelcome       = 64 << 10
+	MaxWelcome       = 1 << 20 // carries the ratchet tree, so it grows with the group (post-quantum leaves are ~1.7 KB each)
 	MaxGroupInfo     = 1 << 20 // carries the ratchet tree, so it grows with the group
 	MaxWelcomes      = 1000
 	MaxHandshakeID   = 64
@@ -108,6 +109,13 @@ func (s *Store) openMLS(ctx context.Context) error {
 			to_user ` + key + ` NOT NULL DEFAULT '', to_dev ` + key + ` NOT NULL DEFAULT '', created_at BIGINT NOT NULL,
 			PRIMARY KEY (tenant, conv, seq))`,
 		`CREATE INDEX IF NOT EXISTS rtc_mls_hs_age ON rtc_mls_hs (created_at)`,
+		// Which devices a stored Welcome is for (the Welcome itself is in rtc_mls_hs, once).
+		`CREATE TABLE IF NOT EXISTS rtc_mls_wto (tenant ` + key + ` NOT NULL, conv ` + key + ` NOT NULL, seq BIGINT NOT NULL,
+			user_id ` + key + ` NOT NULL, device ` + key + ` NOT NULL, PRIMARY KEY (tenant, conv, user_id, device, seq))`,
+		// The verifier of each epoch's group send token: SHA-256 of a secret every
+		// member derives and the service never sees. See SealedOK.
+		`CREATE TABLE IF NOT EXISTS rtc_mls_sealed (tenant ` + key + ` NOT NULL, conv ` + key + ` NOT NULL, epoch BIGINT NOT NULL,
+			verifier VARCHAR(64) NOT NULL, PRIMARY KEY (tenant, conv, epoch))`,
 		// People taken out of the roster whom no commit has yet removed.
 		`CREATE TABLE IF NOT EXISTS rtc_mls_removed (tenant ` + key + ` NOT NULL, conv ` + key + ` NOT NULL, user_id ` + key + ` NOT NULL,
 			at BIGINT NOT NULL, PRIMARY KEY (tenant, conv, user_id))`,
@@ -424,12 +432,16 @@ func (s *Store) ValidSuite(suite int) bool {
 	return false
 }
 
-// DefaultMLSSuites are the three RFC 9420 suites the service will carry
-// without configuration. The service never inspects a suite's meaning: it
+// DefaultMLSSuites are the three RFC 9420 suites and the post-quantum hybrid
+// the service will carry without configuration. The service never inspects a suite's meaning: it
 // records the one a group was created with and carries it back, so a client
 // can refuse to join a group whose suite it considers too weak. Configure
 // Options.MLSSuites to add a post-quantum suite, or to forbid the others.
-var DefaultMLSSuites = []int{0x0001, 0x0002, 0x0003}
+var DefaultMLSSuites = []int{0x0001, 0x0002, 0x0003, SuiteHybridPQ}
+
+// SuiteHybridPQ is MLS_128_MLKEM768X25519_AES128GCM_SHA256_Ed25519: ML-KEM-768 and
+// X25519 together, so a group stays safe if either is broken.
+const SuiteHybridPQ = 0x004F
 
 // CreateMLSGroup binds a conversation to an MLS group. The conversation must
 // not already use the older epoch scheme, and may be bound only once; the
@@ -542,11 +554,13 @@ func (s *Store) RemovedFromRoster(ctx context.Context, tenant, conv string, user
 		if err != nil && !dbx.IsDuplicate(err) {
 			return true, err
 		}
-		if _, err := s.db.ExecContext(ctx, s.rebind(`DELETE FROM rtc_mls_hs WHERE tenant=$1 AND conv=$2 AND kind=$3 AND to_user=$4`), tenant, conv, KindWelcome, u); err != nil {
+		if _, err := s.db.ExecContext(ctx, s.rebind(`DELETE FROM rtc_mls_wto WHERE tenant=$1 AND conv=$2 AND user_id=$3`), tenant, conv, u); err != nil {
 			return true, err
 		}
 	}
-	return true, nil
+	// A Welcome nobody is left to read is not kept.
+	_, err = s.db.ExecContext(ctx, s.rebind(`DELETE FROM rtc_mls_hs WHERE tenant=$1 AND conv=$2 AND kind=$3 AND NOT EXISTS (SELECT 1 FROM rtc_mls_wto w WHERE w.tenant=rtc_mls_hs.tenant AND w.conv=rtc_mls_hs.conv AND w.seq=rtc_mls_hs.seq)`), tenant, conv, KindWelcome)
+	return true, err
 }
 
 // ---------------------------------------------------------------------------
@@ -593,6 +607,9 @@ type CommitIn struct {
 	GroupInfo string
 	// Removed are the people this commit removes from the group.
 	Removed []string
+	// SealedVerifier, if set, is the verifier of the new epoch's send token,
+	// stored in the same step so the epoch never exists without it.
+	SealedVerifier string
 }
 
 // CommitOut says what a commit did.
@@ -612,7 +629,8 @@ type CommitOut struct {
 // already created. members is the roster; a welcome can go only to a member.
 func (s *Store) Commit(ctx context.Context, in CommitIn, members []string) (CommitOut, error) {
 	if in.Epoch < 1 || in.ID == "" || len(in.ID) > MaxHandshakeID || !validB64(in.Body, MaxCommit) || len(in.Welcomes) > MaxWelcomes ||
-		(in.GroupInfo != "" && !validB64(in.GroupInfo, MaxGroupInfo)) || !ValidDeviceID(in.ByDevice) {
+		(in.GroupInfo != "" && !validB64(in.GroupInfo, MaxGroupInfo)) || !ValidDeviceID(in.ByDevice) ||
+		(in.SealedVerifier != "" && !validVerifier(in.SealedVerifier)) {
 		return CommitOut{}, ErrInvalid
 	}
 	if d, err := s.device(ctx, in.Tenant, in.By, in.ByDevice); err == nil && d.Revoked {
@@ -620,35 +638,48 @@ func (s *Store) Commit(ctx context.Context, in CommitIn, members []string) (Comm
 	} else if err != nil && !errors.Is(err, ErrNotFound) {
 		return CommitOut{}, err
 	}
+	// Every welcome is a delivery: one body and the devices it is for. A Welcome
+	// made for several devices is stored once, however many it is for (it carries
+	// the ratchet tree, which with post-quantum keys is large).
+	type delivery struct {
+		to []Recipient
+		w  string
+	}
+	var deliveries []delivery
 	for _, sw := range in.Shared {
 		if len(sw.To) == 0 {
 			return CommitOut{}, fmt.Errorf("%w: a shared welcome names who it is for", ErrInvalid)
 		}
-		for _, r := range sw.To {
-			in.Welcomes = append(in.Welcomes, Welcome{User: r.User, Device: r.Device, W: sw.W})
-			if len(in.Welcomes) > MaxWelcomes {
-				return CommitOut{}, fmt.Errorf("%w: at most %d welcomes in a commit", ErrInvalid, MaxWelcomes)
-			}
-		}
+		deliveries = append(deliveries, delivery{sw.To, sw.W})
+	}
+	for _, w := range in.Welcomes {
+		deliveries = append(deliveries, delivery{[]Recipient{{User: w.User, Device: w.Device}}, w.W})
 	}
 	isMember := make(map[string]bool, len(members))
 	for _, m := range members {
 		isMember[m] = true
 	}
-	seenW := map[[2]string]bool{}
-	total := 0
-	for _, w := range in.Welcomes {
-		k := [2]string{w.User, w.Device}
-		if !isMember[w.User] || !ValidDeviceID(w.Device) || !validB64(w.W, MaxWelcome) {
-			return CommitOut{}, fmt.Errorf("%w: a welcome is for a device of a current member, 1 to %d characters", ErrInvalid, MaxWelcome)
+	seenW := map[Recipient]bool{}
+	total, recipients := 0, 0
+	for _, d := range deliveries {
+		if !validB64(d.w, MaxWelcome) {
+			return CommitOut{}, fmt.Errorf("%w: a welcome is 1 to %d characters", ErrInvalid, MaxWelcome)
 		}
-		if seenW[k] {
-			return CommitOut{}, fmt.Errorf("%w: %s/%s has two welcomes", ErrInvalid, w.User, w.Device)
+		total += len(d.w)
+		for _, r := range d.to {
+			if !isMember[r.User] || !ValidDeviceID(r.Device) {
+				return CommitOut{}, fmt.Errorf("%w: a welcome is for a device of a current member", ErrInvalid)
+			}
+			if seenW[r] {
+				return CommitOut{}, fmt.Errorf("%w: %s/%s has two welcomes", ErrInvalid, r.User, r.Device)
+			}
+			seenW[r] = true
+			if recipients++; recipients > MaxWelcomes {
+				return CommitOut{}, fmt.Errorf("%w: at most %d welcomes in a commit", ErrInvalid, MaxWelcomes)
+			}
 		}
-		seenW[k] = true
-		total += len(w.W)
 	}
-	if total > 16<<20 { // what is written, after a shared welcome is expanded
+	if total > 16<<20 {
 		return CommitOut{}, ErrInvalid
 	}
 	for _, u := range in.Removed {
@@ -683,7 +714,7 @@ func (s *Store) Commit(ctx context.Context, in CommitIn, members []string) (Comm
 		_ = tx.Rollback()
 		return s.commitLost(ctx, in)
 	}
-	k := int64(1 + len(in.Welcomes))
+	k := int64(1 + len(deliveries))
 	if in.GroupInfo != "" {
 		_, err = tx.ExecContext(ctx, s.rebind(`UPDATE rtc_mls_group SET seq=seq+$1, group_info=$2, gi_epoch=$3, updated_at=$4 WHERE tenant=$5 AND conv=$6`), k, in.GroupInfo, in.Epoch, now, in.Tenant, in.Conv)
 	} else {
@@ -701,12 +732,29 @@ func (s *Store) Commit(ctx context.Context, in CommitIn, members []string) (Comm
 	rows := make([]hsRow, 0, k)
 	rows = append(rows, hsRow{seq: first, kind: KindCommit, mid: in.ID, body: in.Body})
 	out := CommitOut{Epoch: in.Epoch, Seq: first, Rekey: rekey != 0}
-	for i, w := range in.Welcomes {
-		rows = append(rows, hsRow{seq: first + 1 + int64(i), kind: KindWelcome, mid: in.ID, body: w.W, toUser: w.User, toDev: w.Device})
-		out.Welcomed = append(out.Welcomed, w.User)
+	var wto []wtoRow
+	welcomed := map[string]bool{}
+	for i, d := range deliveries {
+		seq := first + 1 + int64(i)
+		rows = append(rows, hsRow{seq: seq, kind: KindWelcome, mid: in.ID, body: d.w})
+		for _, r := range d.to {
+			wto = append(wto, wtoRow{seq, r})
+			if !welcomed[r.User] {
+				welcomed[r.User] = true
+				out.Welcomed = append(out.Welcomed, r.User)
+			}
+		}
 	}
 	if err := s.insertHS(ctx, tx, in.Tenant, in.Conv, in.Epoch, in.By, in.ByDevice, now, rows); err != nil {
 		return CommitOut{}, err
+	}
+	if err := s.insertWto(ctx, tx, in.Tenant, in.Conv, wto); err != nil {
+		return CommitOut{}, err
+	}
+	if in.SealedVerifier != "" {
+		if err := s.putSealed(ctx, tx, in.Tenant, in.Conv, in.Epoch, in.SealedVerifier); err != nil {
+			return CommitOut{}, err
+		}
 	}
 	if err := tx.Commit(); err != nil {
 		return CommitOut{}, err
@@ -733,6 +781,33 @@ func (s *Store) commitLost(ctx context.Context, in CommitIn) (CommitOut, error) 
 		return CommitOut{}, err
 	}
 	return CommitOut{}, &EpochConflict{Current: g.Epoch}
+}
+
+type wtoRow struct {
+	seq int64
+	to  Recipient
+}
+
+// insertWto records which devices each stored Welcome is for.
+func (s *Store) insertWto(ctx context.Context, tx *sql.Tx, tenant, conv string, rows []wtoRow) error {
+	for i := 0; i < len(rows); i += 200 {
+		part := rows[i:min(i+200, len(rows))]
+		var sb strings.Builder
+		sb.WriteString(`INSERT INTO rtc_mls_wto (tenant, conv, seq, user_id, device) VALUES `)
+		args := make([]any, 0, len(part)*5)
+		for j, r := range part {
+			if j > 0 {
+				sb.WriteByte(',')
+			}
+			b := len(args)
+			fmt.Fprintf(&sb, "($%d,$%d,$%d,$%d,$%d)", b+1, b+2, b+3, b+4, b+5)
+			args = append(args, tenant, conv, r.seq, r.to.User, r.to.Device)
+		}
+		if _, err := tx.ExecContext(ctx, s.rebind(sb.String()), args...); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 type hsRow struct {
@@ -826,9 +901,10 @@ func (s *Store) Sync(ctx context.Context, tenant, conv, user, device string, aft
 	if limit <= 0 || limit > MaxSyncPage {
 		limit = MaxSyncPage
 	}
-	rows, err := s.db.QueryContext(ctx, s.rebind(`SELECT seq, epoch, kind, mid, sender, sender_dev, body, created_at FROM rtc_mls_hs
-		WHERE tenant=$1 AND conv=$2 AND seq>$3 AND (kind<>$4 OR (to_user=$5 AND to_dev=$6)) ORDER BY seq ASC LIMIT `+fmt.Sprint(limit+1)),
-		tenant, conv, after, KindWelcome, user, device)
+	rows, err := s.db.QueryContext(ctx, s.rebind(`SELECT h.seq, h.epoch, h.kind, h.mid, h.sender, h.sender_dev, h.body, h.created_at FROM rtc_mls_hs h
+		WHERE h.tenant=$1 AND h.conv=$2 AND h.seq>$3 AND (h.kind<>$4 OR EXISTS (SELECT 1 FROM rtc_mls_wto w WHERE w.tenant=$5 AND w.conv=$6 AND w.seq=h.seq AND w.user_id=$7 AND w.device=$8))
+		ORDER BY h.seq ASC LIMIT `+fmt.Sprint(limit+1)),
+		tenant, conv, after, KindWelcome, tenant, conv, user, device)
 	if err != nil {
 		return nil, false, err
 	}
@@ -877,5 +953,102 @@ func (s *Store) PruneMLS(ctx context.Context, keep time.Duration, keepMin int64)
 			return total, err
 		}
 	}
-	return total, nil
+	// Recipients of Welcomes that are gone.
+	err := run(`DELETE FROM rtc_mls_wto WHERE NOT EXISTS (SELECT 1 FROM rtc_mls_hs h WHERE h.tenant=rtc_mls_wto.tenant AND h.conv=rtc_mls_wto.conv AND h.seq=rtc_mls_wto.seq)`)
+	return total, err
+}
+
+// ---------------------------------------------------------------------------
+// Sealed send: a message the service cannot attribute to a member.
+// ---------------------------------------------------------------------------
+
+// Every member of an MLS group can derive the same secret for an epoch (the RFC
+// 9420 exporter), and nobody else can. A member shows the service that secret,
+// as a token, to send an application message without signing in: the service
+// checks the token against the verifier it holds (the secret's SHA-256), stores
+// the message with no sender, and learns that someone in the group spoke, not
+// who. The sender is authenticated inside the MLS message, to the members, which
+// is where it belongs.
+//
+// The token changes with every epoch, so a removed member's token stops working
+// with the commit that removes them. The service keeps the verifier of the
+// current epoch and the one before it, like the message epoch it accepts.
+
+// SealedSender is the sender recorded for a sealed message.
+const SealedSender = "~sealed"
+
+func validVerifier(v string) bool {
+	if len(v) != 64 {
+		return false
+	}
+	for _, c := range v {
+		if !strings.ContainsRune("0123456789abcdef", c) {
+			return false
+		}
+	}
+	return true
+}
+
+func (s *Store) putSealed(ctx context.Context, q interface {
+	ExecContext(context.Context, string, ...any) (sql.Result, error)
+}, tenant, conv string, epoch int64, verifier string) error {
+	if _, err := q.ExecContext(ctx, s.rebind(`DELETE FROM rtc_mls_sealed WHERE tenant=$1 AND conv=$2 AND (epoch<$3 OR epoch=$4)`), tenant, conv, epoch-1, epoch); err != nil {
+		return err
+	}
+	_, err := q.ExecContext(ctx, s.rebind(`INSERT INTO rtc_mls_sealed (tenant, conv, epoch, verifier) VALUES ($1,$2,$3,$4)`), tenant, conv, epoch, verifier)
+	return err
+}
+
+// SetSealedVerifier records the verifier of the send token for an epoch, which
+// must be the group's current one. Any member may set it, because every member
+// derives the same token and can check what is stored; a member who sets a
+// wrong one only stops sealed sends until another corrects it.
+func (s *Store) SetSealedVerifier(ctx context.Context, tenant, conv string, epoch int64, verifier string) error {
+	if !validVerifier(verifier) {
+		return ErrInvalid
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	var cur int64
+	if err := tx.QueryRowContext(ctx, s.rebind(`SELECT epoch FROM rtc_conv WHERE tenant=$1 AND conv=$2 AND mls=1`), tenant, conv).Scan(&cur); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return ErrNotFound
+		}
+		return err
+	}
+	if epoch != cur {
+		return &EpochConflict{Current: cur}
+	}
+	if err := s.putSealed(ctx, tx, tenant, conv, epoch, verifier); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// SealedOK reports whether token is the send token of the conversation's
+// current or previous epoch. A conversation that does not exist, has no
+// verifier for that epoch, or is given a wrong token all answer the same, so
+// the endpoint is no oracle for which conversations exist.
+func (s *Store) SealedOK(ctx context.Context, tenant, conv string, epoch int64, token []byte) (State, bool, error) {
+	st, err := s.State(ctx, tenant, conv)
+	if err != nil {
+		return State{}, false, err
+	}
+	if !st.MLS || (epoch != st.Epoch && epoch != st.Epoch-1) || epoch < 0 {
+		return st, false, nil
+	}
+	var verifier string
+	err = s.db.QueryRowContext(ctx, s.rebind(`SELECT verifier FROM rtc_mls_sealed WHERE tenant=$1 AND conv=$2 AND epoch=$3`), tenant, conv, epoch).Scan(&verifier)
+	if errors.Is(err, sql.ErrNoRows) {
+		return st, false, nil
+	}
+	if err != nil {
+		return st, false, err
+	}
+	sum := sha256.Sum256(token)
+	want := hex.EncodeToString(sum[:])
+	return st, subtle.ConstantTimeCompare([]byte(want), []byte(verifier)) == 1, nil
 }

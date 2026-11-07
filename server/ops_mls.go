@@ -41,6 +41,8 @@ type mlsBody struct {
 	Shared    []chat.SharedWelcome `json:"shared_welcomes"`
 	GroupInfo string               `json:"group_info"`
 	Removed   []string             `json:"removed"`
+	// SealedVerifier is the SHA-256 (hex) of the new epoch's group send token.
+	SealedVerifier string `json:"sealed_verifier"`
 }
 
 func (s *Server) registerMLS() {
@@ -202,7 +204,7 @@ func (s *Server) registerMLS() {
 		o.note("epoch", in.Epoch)
 		o.note("welcomes", len(in.Welcomes))
 		out, err := s.Chat.Commit(o, chat.CommitIn{Tenant: tenant, Conv: in.Conv, By: me, ByDevice: in.Device, Epoch: in.Epoch, ID: in.ID,
-			Body: in.Body, Welcomes: in.Welcomes, Shared: in.Shared, GroupInfo: in.GroupInfo, Removed: in.Removed}, ci.members)
+			Body: in.Body, Welcomes: in.Welcomes, Shared: in.Shared, GroupInfo: in.GroupInfo, Removed: in.Removed, SealedVerifier: in.SealedVerifier}, ci.members)
 		if err != nil {
 			return nil, err
 		}
@@ -306,6 +308,29 @@ func (s *Server) registerMLS() {
 			return nil, err
 		}
 		return map[string]any{"messages": list, "more": more, "epoch": st.Epoch, "rekey_required": st.Rekey}, nil
+	}})
+
+	// mls.sealed.set {conv, epoch, verifier}: records the SHA-256 (hex) of the
+	// group send token for the current epoch, so a member can send without
+	// signing in (POST /v1/sealed/send). Every member derives the token from the
+	// MLS exporter and can check what is stored; the service never sees it.
+	reg("mls.sealed.set", opDef{run: func(o *opCtx, raw json.RawMessage) (any, error) {
+		in, err := decode[struct {
+			Conv     string `json:"conv"`
+			Epoch    int64  `json:"epoch"`
+			Verifier string `json:"verifier"`
+		}](raw)
+		if err != nil {
+			return nil, err
+		}
+		o.target = in.Conv
+		if _, err := s.conv(o, in.Conv); err != nil {
+			return nil, err
+		}
+		if err := s.Chat.SetSealedVerifier(o, o.sess.who.Tenant, in.Conv, in.Epoch, in.Verifier); err != nil {
+			return nil, err
+		}
+		return map[string]any{"epoch": in.Epoch}, nil
 	}})
 
 	// mls.groupinfo.put {conv, epoch, group_info}: refreshes the stored GroupInfo
