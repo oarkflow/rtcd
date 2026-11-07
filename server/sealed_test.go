@@ -12,6 +12,13 @@ import (
 	"github.com/oarkflow/rtcd/server"
 )
 
+// frozen stops the clock the server's rate limiters read, so a test of "N requests trip the limit" does not depend on
+// how fast the machine (or the database behind it) is: with no time passing, no tokens come back.
+func frozen(c *server.Config) {
+	t := time.Now()
+	c.Now = func() time.Time { return t }
+}
+
 func tokenFor(seed string) (token, verifier string) {
 	t := sha256.Sum256([]byte("token:" + seed))
 	v := sha256.Sum256(t[:])
@@ -173,7 +180,7 @@ func (p *peer) dialRemove(t *testing.T, conv, user string) {
 }
 
 func TestTheOpenEndpointIsRateLimitedPerAddressAndSizeLimited(t *testing.T) {
-	s := start(t, nil)
+	s := start(t, frozen)
 	conv, _, _ := sealedGroup(t, s)
 	tok, _ := tokenFor("e1")
 	limited := 0
@@ -208,7 +215,7 @@ func TestEveryMLSOperationIsReachableOverREST(t *testing.T) {
 
 func TestBehindTheGatewayEachSenderIsLimitedByTheirOwnAddress(t *testing.T) {
 	const edge = "edge-secret-0123456789-abcdef-xyz"
-	s := start(t, func(c *server.Config) { c.EdgeSecret = edge })
+	s := start(t, func(c *server.Config) { frozen(c); c.EdgeSecret = edge })
 	// Set up over REST as the backend does: the service key acting for a user, with the edge secret.
 	backend := func(user, path string, body map[string]any) (int, []byte) {
 		b, _ := json.Marshal(body)
@@ -253,7 +260,7 @@ func TestBehindTheGatewayEachSenderIsLimitedByTheirOwnAddress(t *testing.T) {
 }
 
 func TestWithoutAnEdgeSecretTheForwardingHeaderIsNotBelieved(t *testing.T) {
-	s := start(t, nil)
+	s := start(t, frozen)
 	conv, _, _ := sealedGroup(t, s)
 	tok, _ := tokenFor("e1")
 	limited := 0

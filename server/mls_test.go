@@ -319,7 +319,7 @@ func TestPublishingPackagesForAConversationTellsItsMembersAndIsForMembersOnly(t 
 	if field(ev.Data, "conv") != g || field(ev.Data, "user") != "bob" || field(ev.Data, "device") != "phone.mls" {
 		t.Fatalf("event: %s", ev.Data)
 	}
-	bob.next("group.added") // what he was told when the group was made
+	bob.next("group.added")          // what he was told when the group was made
 	bob.none(100 * time.Millisecond) // and not told about his own packages
 	if err := eve.call("mls.kp.put", map[string]any{"device": "d", "conv": g, "kps": []map[string]any{{"kp": mb64("e1")}}}, nil); code(err) != "forbidden" {
 		t.Fatalf("a stranger published packages for a conversation: %v", err)
