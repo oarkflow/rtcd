@@ -114,6 +114,8 @@ func (s *Server) registerMLS() {
 		in, err := decode[struct {
 			Conv  string   `json:"conv"`
 			Users []string `json:"users"`
+			// Devices, if set, limits the claim to these devices of those users.
+			Devices []chat.Recipient `json:"devices"`
 		}](raw)
 		if err != nil {
 			return nil, err
@@ -139,7 +141,7 @@ func (s *Server) registerMLS() {
 				return nil, &apiError{429, "rate_limited", "key packages for " + u + " were claimed too often"}
 			}
 		}
-		got, missing, err := s.Chat.ClaimKeyPackagesFor(o, o.sess.who.Tenant, in.Conv, in.Users)
+		got, missing, err := s.Chat.ClaimDevicePackages(o, o.sess.who.Tenant, in.Conv, in.Users, in.Devices)
 		if got == nil {
 			got = []chat.Claimed{}
 		}

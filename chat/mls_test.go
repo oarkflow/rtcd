@@ -671,3 +671,31 @@ func TestADeviceWithOnlyGeneralPackagesStillServesAnyConversation(t *testing.T) 
 		t.Fatalf("a conversation's own package should win: %+v", got)
 	}
 }
+
+func TestAClaimCanBeLimitedToTheDevicesThatAreNeeded(t *testing.T) {
+	s := mlsStore(t)
+	for _, d := range []string{"phone", "tablet"} {
+		if _, err := s.PutKeyPackagesFor(mbg, "t", "C", "bob", d, []chat.KPIn{{KP: b64(d + "-1")}, {KP: b64(d + "-2")}, {KP: b64(d + "-last"), LastResort: true}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Bob's phone is in the group; his tablet is new. Ask for the tablet only.
+	got, _, err := s.ClaimDevicePackages(mbg, "t", "C", []string{"bob"}, []chat.Recipient{{User: "bob", Device: "tablet"}})
+	if err != nil || len(got) != 1 || got[0].Device != "tablet" {
+		t.Fatalf("only the tablet: %+v %v", got, err)
+	}
+	// The phone's packages were not touched.
+	if av, _, _ := s.KeyPackageCountFor(mbg, "t", "C", "bob", "phone"); av != 2 {
+		t.Fatalf("the phone lost a package it was not asked for: %d", av)
+	}
+	// A device that has published nothing for the conversation yields nothing, and is not an error.
+	got, missing, err := s.ClaimDevicePackages(mbg, "t", "C", []string{"bob"}, []chat.Recipient{{User: "bob", Device: "watch"}})
+	if err != nil || len(got) != 0 || len(missing) != 1 {
+		t.Fatalf("a device with nothing published: %+v %v %v", got, missing, err)
+	}
+	// Without a list it is the whole person, as before.
+	got, _, _ = s.ClaimDevicePackages(mbg, "t", "C", []string{"bob"}, nil)
+	if len(got) != 2 {
+		t.Fatalf("a claim for the person: %+v", got)
+	}
+}

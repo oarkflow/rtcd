@@ -306,12 +306,19 @@ func (s *Store) ClaimKeyPackages(ctx context.Context, tenant string, users []str
 // published packages for conv gives one of those; one that has not gives a
 // package it published for no conversation in particular, if it has one.
 func (s *Store) ClaimKeyPackagesFor(ctx context.Context, tenant, conv string, users []string) (out []Claimed, missing []string, err error) {
+	return s.ClaimDevicePackages(ctx, tenant, conv, users, nil)
+}
+
+// ClaimDevicePackages is ClaimKeyPackagesFor limited to the named devices when only is not empty. A person who
+// already has a device in the group and gets another asks for just the new one: a claim for the person would spend a
+// single-use package of every device they have, including those already in the group.
+func (s *Store) ClaimDevicePackages(ctx context.Context, tenant, conv string, users []string, only []Recipient) (out []Claimed, missing []string, err error) {
 	if len(users) == 0 || len(users) > MaxClaimUsers {
 		return nil, nil, ErrInvalid
 	}
 	now := s.o.Now().UnixMilli()
 	for attempt := 0; attempt < 4; attempt++ {
-		out, missing, err = s.claimOnce(ctx, tenant, conv, users, now)
+		out, missing, err = s.claimOnce(ctx, tenant, conv, users, now, only)
 		if !errors.Is(err, errClaimRace) {
 			return out, missing, err
 		}
@@ -321,7 +328,7 @@ func (s *Store) ClaimKeyPackagesFor(ctx context.Context, tenant, conv string, us
 
 var errClaimRace = errors.New("chat: claim raced")
 
-func (s *Store) claimOnce(ctx context.Context, tenant, conv string, users []string, now int64) ([]Claimed, []string, error) {
+func (s *Store) claimOnce(ctx context.Context, tenant, conv string, users []string, now int64, only []Recipient) ([]Claimed, []string, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, nil, err
@@ -367,7 +374,14 @@ func (s *Store) claimOnce(ctx context.Context, tenant, conv string, users []stri
 		rr.Close()
 	}
 	keys := make([][2]string, 0, len(devs))
+	want := map[[2]string]bool{}
+	for _, r := range only {
+		want[[2]string{r.User, r.Device}] = true
+	}
 	for k := range devs {
+		if len(only) > 0 && !want[k] {
+			continue
+		}
 		keys = append(keys, k)
 	}
 	sort.Slice(keys, func(i, j int) bool {
