@@ -57,6 +57,7 @@ func (s *Server) registerMLS() {
 	reg("mls.kp.put", opDef{maxBody: 1 << 20, run: func(o *opCtx, raw json.RawMessage) (any, error) {
 		in, err := decode[struct {
 			Device string      `json:"device"`
+			Conv   string      `json:"conv"`
 			KPs    []chat.KPIn `json:"kps"`
 		}](raw)
 		if err != nil {
@@ -64,9 +65,26 @@ func (s *Server) registerMLS() {
 		}
 		o.target = in.Device
 		o.note("count", len(in.KPs))
-		n, err := s.Chat.PutKeyPackages(o, o.sess.who.Tenant, o.sess.who.ID, in.Device, in.KPs)
+		tenant, me := o.sess.who.Tenant, o.sess.who.ID
+		// Packages for a conversation: the caller must be in it, and its members
+		// are told, so whoever is adding people knows these are there now.
+		var ci *convInfo
+		if in.Conv != "" {
+			if ci, err = s.conv(o, in.Conv); err != nil {
+				return nil, err
+			}
+		}
+		n, err := s.Chat.PutKeyPackagesFor(o, tenant, in.Conv, me, in.Device, in.KPs)
 		if err != nil {
 			return nil, err
+		}
+		if ci != nil && n > 0 {
+			raw, _ := jsonMarshal(map[string]any{"conv": in.Conv, "user": me, "device": in.Device})
+			for _, u := range ci.members {
+				if u != me {
+					_ = s.Notify(context.Background(), tenant, u, "mls.kp.ready", raw, me)
+				}
+			}
 		}
 		return map[string]any{"added": n}, nil
 	}})
@@ -75,6 +93,7 @@ func (s *Server) registerMLS() {
 	reg("mls.kp.count", opDef{quiet: true, run: func(o *opCtx, raw json.RawMessage) (any, error) {
 		in, err := decode[struct {
 			Device string `json:"device"`
+			Conv   string `json:"conv"`
 		}](raw)
 		if err != nil {
 			return nil, err
@@ -82,7 +101,7 @@ func (s *Server) registerMLS() {
 		if !chat.ValidDeviceID(in.Device) {
 			return nil, bad("device is required")
 		}
-		n, lr, err := s.Chat.KeyPackageCount(o, o.sess.who.Tenant, o.sess.who.ID, in.Device)
+		n, lr, err := s.Chat.KeyPackageCountFor(o, o.sess.who.Tenant, in.Conv, o.sess.who.ID, in.Device)
 		return map[string]any{"available": n, "last_resort": lr}, err
 	}})
 
@@ -120,7 +139,7 @@ func (s *Server) registerMLS() {
 				return nil, &apiError{429, "rate_limited", "key packages for " + u + " were claimed too often"}
 			}
 		}
-		got, missing, err := s.Chat.ClaimKeyPackages(o, o.sess.who.Tenant, in.Users)
+		got, missing, err := s.Chat.ClaimKeyPackagesFor(o, o.sess.who.Tenant, in.Conv, in.Users)
 		if got == nil {
 			got = []chat.Claimed{}
 		}

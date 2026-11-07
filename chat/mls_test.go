@@ -613,3 +613,61 @@ func TestALargeWelcomeForManyDevicesIsStoredOnce(t *testing.T) {
 		t.Fatalf("a welcome nobody can read was kept: %d", copies)
 	}
 }
+
+func TestKeyPackagesAreScopedToTheConversationTheyWerePublishedFor(t *testing.T) {
+	s := mlsStore(t)
+	put := func(conv string, kps ...chat.KPIn) {
+		t.Helper()
+		if _, err := s.PutKeyPackagesFor(mbg, "t", conv, "bob", "d", kps); err != nil {
+			t.Fatal(err)
+		}
+	}
+	put("X", chat.KPIn{KP: b64("x1")}, chat.KPIn{KP: b64("x-last"), LastResort: true})
+	put("Y", chat.KPIn{KP: b64("y1")}, chat.KPIn{KP: b64("y-last"), LastResort: true})
+
+	// Each conversation's packages are its own: their private halves live in different clients.
+	for _, c := range []struct{ conv, want string }{{"X", "x1"}, {"Y", "y1"}} {
+		got, _, err := s.ClaimKeyPackagesFor(mbg, "t", c.conv, []string{"bob"})
+		if err != nil || len(got) != 1 || got[0].KP != b64(c.want) {
+			t.Fatalf("claim for %s: %+v %v", c.conv, got, err)
+		}
+	}
+	// X's single-use one is spent; X now gets X's last resort, never Y's.
+	got, _, _ := s.ClaimKeyPackagesFor(mbg, "t", "X", []string{"bob"})
+	if len(got) != 1 || got[0].KP != b64("x-last") || !got[0].LastResort {
+		t.Fatalf("X after its single-use package: %+v", got)
+	}
+	// A conversation the device never published for gets nothing: not X's, not Y's.
+	got, missing, _ := s.ClaimKeyPackagesFor(mbg, "t", "Z", []string{"bob"})
+	if len(got) != 0 || len(missing) != 1 {
+		t.Fatalf("Z borrowed another conversation's package: %+v", got)
+	}
+	// Counts are per conversation, and one conversation's last resort replaces only its own.
+	put("X", chat.KPIn{KP: b64("x-last-2"), LastResort: true})
+	if av, lr, _ := s.KeyPackageCountFor(mbg, "t", "Y", "bob", "d"); av != 0 || !lr {
+		t.Fatalf("Y count: %d %v", av, lr)
+	}
+	if got, _, _ := s.ClaimKeyPackagesFor(mbg, "t", "Y", []string{"bob"}); got[0].KP != b64("y-last") {
+		t.Fatalf("X's new last resort replaced Y's: %+v", got)
+	}
+}
+
+func TestADeviceWithOnlyGeneralPackagesStillServesAnyConversation(t *testing.T) {
+	s := mlsStore(t)
+	if _, err := s.PutKeyPackages(mbg, "t", "bob", "d", []chat.KPIn{{KP: b64("g1")}, {KP: b64("g-last"), LastResort: true}}); err != nil {
+		t.Fatal(err)
+	}
+	// Earlier clients published without a conversation; that keeps working.
+	got, _, err := s.ClaimKeyPackagesFor(mbg, "t", "anything", []string{"bob"})
+	if err != nil || len(got) != 1 || got[0].KP != b64("g1") {
+		t.Fatalf("fallback to a general package: %+v %v", got, err)
+	}
+	// But once the device publishes for that conversation, that is what is used.
+	if _, err := s.PutKeyPackagesFor(mbg, "t", "anything", "bob", "d", []chat.KPIn{{KP: b64("own")}}); err != nil {
+		t.Fatal(err)
+	}
+	got, _, _ = s.ClaimKeyPackagesFor(mbg, "t", "anything", []string{"bob"})
+	if got[0].KP != b64("own") {
+		t.Fatalf("a conversation's own package should win: %+v", got)
+	}
+}
