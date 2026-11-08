@@ -305,3 +305,38 @@ func TestMessagesAreReachableOverREST(t *testing.T) {
 		t.Fatalf("history: %d %s", st, b)
 	}
 }
+
+func TestPublishingPackagesForAConversationTellsItsMembersAndIsForMembersOnly(t *testing.T) {
+	s := start(t, nil)
+	ada, bob, eve := s.dial(s.acme, "ada"), s.dial(s.acme, "bob"), s.dial(s.acme, "eve")
+	g := group(t, ada, "bob")
+	var out struct{ Added int }
+	bob.must("mls.kp.put", map[string]any{"device": "phone.mls", "conv": g, "kps": []map[string]any{{"kp": mb64("k1")}, {"kp": mb64("k-last"), "last_resort": true}}}, &out)
+	if out.Added != 2 {
+		t.Fatalf("added %d", out.Added)
+	}
+	ev := ada.next("mls.kp.ready")
+	if field(ev.Data, "conv") != g || field(ev.Data, "user") != "bob" || field(ev.Data, "device") != "phone.mls" {
+		t.Fatalf("event: %s", ev.Data)
+	}
+	bob.next("group.added")          // what he was told when the group was made
+	bob.none(100 * time.Millisecond) // and not told about his own packages
+	if err := eve.call("mls.kp.put", map[string]any{"device": "d", "conv": g, "kps": []map[string]any{{"kp": mb64("e1")}}}, nil); code(err) != "forbidden" {
+		t.Fatalf("a stranger published packages for a conversation: %v", err)
+	}
+	var cl struct {
+		KeyPackages []claimed `json:"key_packages"`
+	}
+	ada.must("mls.kp.claim", map[string]any{"conv": g, "users": []string{"bob"}}, &cl)
+	if len(cl.KeyPackages) != 1 || cl.KeyPackages[0].Device != "phone.mls" || cl.KeyPackages[0].KP != mb64("k1") {
+		t.Fatalf("claim: %+v", cl)
+	}
+	var cnt struct {
+		Available  int
+		LastResort bool `json:"last_resort"`
+	}
+	bob.must("mls.kp.count", map[string]any{"device": "phone.mls", "conv": g}, &cnt)
+	if cnt.Available != 0 || !cnt.LastResort {
+		t.Fatalf("count: %+v", cnt)
+	}
+}

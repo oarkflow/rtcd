@@ -124,6 +124,9 @@ func (s *Store) openMLS(ctx context.Context) error {
 			return fmt.Errorf("chat: schema: %w", err)
 		}
 	}
+	if err := dbx.AddColumn(ctx, s.db, "rtc_mls_kp", "conv", "VARCHAR(191) NOT NULL DEFAULT ''"); err != nil {
+		return err
+	}
 	return dbx.AddColumn(ctx, s.db, "rtc_conv", "mls", "INTEGER NOT NULL DEFAULT 0")
 }
 
@@ -161,6 +164,15 @@ type KPIn struct {
 // package; a new last-resort package replaces the old one. Publishing a package
 // the service already holds is not an error and adds nothing.
 func (s *Store) PutKeyPackages(ctx context.Context, tenant, user, device string, in []KPIn) (added int, err error) {
+	return s.PutKeyPackagesFor(ctx, tenant, "", user, device, in)
+}
+
+// PutKeyPackagesFor is PutKeyPackages for the packages of one conversation. The
+// engine holds one group per client, and a package's private half lives in the
+// client that made it, so a device that is in several conversations makes its
+// packages in each conversation's own client and publishes them for that
+// conversation; a claim for the conversation hands out those.
+func (s *Store) PutKeyPackagesFor(ctx context.Context, tenant, conv, user, device string, in []KPIn) (added int, err error) {
 	if !ValidDeviceID(device) || len(in) == 0 || len(in) > MaxPutBatch {
 		return 0, ErrInvalid
 	}
@@ -179,7 +191,7 @@ func (s *Store) PutKeyPackages(ctx context.Context, tenant, user, device string,
 	// nothing after a failed statement can run), so the whole upload is redone,
 	// and the second time the package is already there to be seen.
 	for attempt := 0; attempt < 3; attempt++ {
-		added, err = s.putKPs(ctx, tenant, user, device, in)
+		added, err = s.putKPs(ctx, tenant, conv, user, device, in)
 		if !dbx.IsDuplicate(err) && !dbx.IsRetryable(err) {
 			return added, err
 		}
@@ -187,7 +199,7 @@ func (s *Store) PutKeyPackages(ctx context.Context, tenant, user, device string,
 	return added, err
 }
 
-func (s *Store) putKPs(ctx context.Context, tenant, user, device string, in []KPIn) (int, error) {
+func (s *Store) putKPs(ctx context.Context, tenant, conv, user, device string, in []KPIn) (int, error) {
 	now := s.o.Now().UnixMilli()
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -195,7 +207,7 @@ func (s *Store) putKPs(ctx context.Context, tenant, user, device string, in []KP
 	}
 	defer tx.Rollback()
 	var have int
-	if err := tx.QueryRowContext(ctx, s.rebind(`SELECT COUNT(*) FROM rtc_mls_kp WHERE tenant=$1 AND user_id=$2 AND device=$3 AND last_resort=0 AND expires_at>$4`), tenant, user, device, now).Scan(&have); err != nil {
+	if err := tx.QueryRowContext(ctx, s.rebind(`SELECT COUNT(*) FROM rtc_mls_kp WHERE tenant=$1 AND user_id=$2 AND device=$3 AND conv=$4 AND last_resort=0 AND expires_at>$5`), tenant, user, device, conv, now).Scan(&have); err != nil {
 		return 0, err
 	}
 	held := map[string]bool{}
@@ -229,15 +241,15 @@ func (s *Store) putKPs(ctx context.Context, tenant, user, device string, in []KP
 		lr := 0
 		if k.LastResort {
 			lr = 1
-			// One per device: the new one replaces the old.
-			if _, err := tx.ExecContext(ctx, s.rebind(`DELETE FROM rtc_mls_kp WHERE tenant=$1 AND user_id=$2 AND device=$3 AND last_resort=1`), tenant, user, device); err != nil {
+			// One per device and conversation: the new one replaces the old.
+			if _, err := tx.ExecContext(ctx, s.rebind(`DELETE FROM rtc_mls_kp WHERE tenant=$1 AND user_id=$2 AND device=$3 AND conv=$4 AND last_resort=1`), tenant, user, device, conv); err != nil {
 				return 0, err
 			}
 		} else if have+added >= MaxKeyPackages {
 			return 0, fmt.Errorf("%w: at most %d key packages per device", ErrLimit, MaxKeyPackages)
 		}
-		if _, err := tx.ExecContext(ctx, s.rebind(`INSERT INTO rtc_mls_kp (tenant, user_id, device, ref, kp, last_resort, created_at, expires_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`),
-			tenant, user, device, ref, k.KP, lr, now, now+ttl.Milliseconds()); err != nil {
+		if _, err := tx.ExecContext(ctx, s.rebind(`INSERT INTO rtc_mls_kp (tenant, user_id, device, conv, ref, kp, last_resort, created_at, expires_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`),
+			tenant, user, device, conv, ref, k.KP, lr, now, now+ttl.Milliseconds()); err != nil {
 			return 0, err
 		}
 		added++
@@ -248,8 +260,13 @@ func (s *Store) putKPs(ctx context.Context, tenant, user, device string, in []KP
 // KeyPackageCount reports how many single-use packages a device has left, and
 // whether it has a last-resort one, so a client knows when to top up.
 func (s *Store) KeyPackageCount(ctx context.Context, tenant, user, device string) (available int, lastResort bool, err error) {
+	return s.KeyPackageCountFor(ctx, tenant, "", user, device)
+}
+
+// KeyPackageCountFor counts one conversation's packages (see PutKeyPackagesFor).
+func (s *Store) KeyPackageCountFor(ctx context.Context, tenant, conv, user, device string) (available int, lastResort bool, err error) {
 	now := s.o.Now().UnixMilli()
-	rows, err := s.db.QueryContext(ctx, s.rebind(`SELECT last_resort, COUNT(*) FROM rtc_mls_kp WHERE tenant=$1 AND user_id=$2 AND device=$3 AND expires_at>$4 GROUP BY last_resort`), tenant, user, device, now)
+	rows, err := s.db.QueryContext(ctx, s.rebind(`SELECT last_resort, COUNT(*) FROM rtc_mls_kp WHERE tenant=$1 AND user_id=$2 AND device=$3 AND conv=$4 AND expires_at>$5 GROUP BY last_resort`), tenant, user, device, conv, now)
 	if err != nil {
 		return 0, false, err
 	}
@@ -282,12 +299,26 @@ type Claimed struct {
 // nothing to give are returned in missing. It is one round trip however many
 // people are being added, which is what makes adding a hundred members cheap.
 func (s *Store) ClaimKeyPackages(ctx context.Context, tenant string, users []string) (out []Claimed, missing []string, err error) {
+	return s.ClaimKeyPackagesFor(ctx, tenant, "", users)
+}
+
+// ClaimKeyPackagesFor claims for adding people to conv. A device that has
+// published packages for conv gives one of those; one that has not gives a
+// package it published for no conversation in particular, if it has one.
+func (s *Store) ClaimKeyPackagesFor(ctx context.Context, tenant, conv string, users []string) (out []Claimed, missing []string, err error) {
+	return s.ClaimDevicePackages(ctx, tenant, conv, users, nil)
+}
+
+// ClaimDevicePackages is ClaimKeyPackagesFor limited to the named devices when only is not empty. A person who
+// already has a device in the group and gets another asks for just the new one: a claim for the person would spend a
+// single-use package of every device they have, including those already in the group.
+func (s *Store) ClaimDevicePackages(ctx context.Context, tenant, conv string, users []string, only []Recipient) (out []Claimed, missing []string, err error) {
 	if len(users) == 0 || len(users) > MaxClaimUsers {
 		return nil, nil, ErrInvalid
 	}
 	now := s.o.Now().UnixMilli()
 	for attempt := 0; attempt < 4; attempt++ {
-		out, missing, err = s.claimOnce(ctx, tenant, users, now)
+		out, missing, err = s.claimOnce(ctx, tenant, conv, users, now, only)
 		if !errors.Is(err, errClaimRace) {
 			return out, missing, err
 		}
@@ -297,13 +328,13 @@ func (s *Store) ClaimKeyPackages(ctx context.Context, tenant string, users []str
 
 var errClaimRace = errors.New("chat: claim raced")
 
-func (s *Store) claimOnce(ctx context.Context, tenant string, users []string, now int64) ([]Claimed, []string, error) {
+func (s *Store) claimOnce(ctx context.Context, tenant, conv string, users []string, now int64, only []Recipient) ([]Claimed, []string, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, nil, err
 	}
 	defer tx.Rollback()
-	q, args := inList(`SELECT user_id, device, ref, kp, last_resort FROM rtc_mls_kp WHERE tenant=$1 AND expires_at>$2 AND user_id IN (`, []any{tenant, now}, users)
+	q, args := inList(`SELECT user_id, device, ref, kp, last_resort, conv FROM rtc_mls_kp WHERE tenant=$1 AND expires_at>$2 AND (conv=$3 OR conv='') AND user_id IN (`, []any{tenant, now, conv}, users)
 	rows, err := tx.QueryContext(ctx, s.rebind(q+` ORDER BY user_id, device, last_resort, created_at`), args...)
 	if err != nil {
 		return nil, nil, err
@@ -311,16 +342,17 @@ func (s *Store) claimOnce(ctx context.Context, tenant string, users []string, no
 	type cand struct {
 		ref, kp string
 		lr      bool
+		scoped  bool // published for this conversation
 	}
 	devs := map[[2]string][]cand{}
 	for rows.Next() {
-		var u, d, ref, kp string
+		var u, d, ref, kp, cv string
 		var lr int
-		if err := rows.Scan(&u, &d, &ref, &kp, &lr); err != nil {
+		if err := rows.Scan(&u, &d, &ref, &kp, &lr, &cv); err != nil {
 			rows.Close()
 			return nil, nil, err
 		}
-		devs[[2]string{u, d}] = append(devs[[2]string{u, d}], cand{ref, kp, lr == 1})
+		devs[[2]string{u, d}] = append(devs[[2]string{u, d}], cand{ref, kp, lr == 1, conv != "" && cv == conv})
 	}
 	rows.Close()
 	// A device that has been revoked gets nothing, even if packages are left.
@@ -342,7 +374,14 @@ func (s *Store) claimOnce(ctx context.Context, tenant string, users []string, no
 		rr.Close()
 	}
 	keys := make([][2]string, 0, len(devs))
+	want := map[[2]string]bool{}
+	for _, r := range only {
+		want[[2]string{r.User, r.Device}] = true
+	}
 	for k := range devs {
+		if len(only) > 0 && !want[k] {
+			continue
+		}
 		keys = append(keys, k)
 	}
 	sort.Slice(keys, func(i, j int) bool {
@@ -357,7 +396,22 @@ func (s *Store) claimOnce(ctx context.Context, tenant string, users []string, no
 		if revoked[k] {
 			continue
 		}
-		c := devs[k][0] // single-use first (the query orders last_resort ascending)
+		cands := devs[k]
+		// The conversation's own packages first; only a device with none of its
+		// own falls back to a general one.
+		for _, c := range cands {
+			if c.scoped {
+				kept := cands[:0:0]
+				for _, c2 := range cands {
+					if c2.scoped {
+						kept = append(kept, c2)
+					}
+				}
+				cands = kept
+				break
+			}
+		}
+		c := cands[0] // single-use first (the query orders last_resort ascending)
 		if !c.lr {
 			r, err := tx.ExecContext(ctx, s.rebind(`DELETE FROM rtc_mls_kp WHERE tenant=$1 AND user_id=$2 AND device=$3 AND ref=$4`), tenant, k[0], k[1], c.ref)
 			if err != nil {

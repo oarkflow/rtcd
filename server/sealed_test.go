@@ -8,7 +8,16 @@ import (
 	"fmt"
 	"testing"
 	"time"
+
+	"github.com/oarkflow/rtcd/server"
 )
+
+// frozen stops the clock the server's rate limiters read, so a test of "N requests trip the limit" does not depend on
+// how fast the machine (or the database behind it) is: with no time passing, no tokens come back.
+func frozen(c *server.Config) {
+	t := time.Now()
+	c.Now = func() time.Time { return t }
+}
 
 func tokenFor(seed string) (token, verifier string) {
 	t := sha256.Sum256([]byte("token:" + seed))
@@ -171,7 +180,7 @@ func (p *peer) dialRemove(t *testing.T, conv, user string) {
 }
 
 func TestTheOpenEndpointIsRateLimitedPerAddressAndSizeLimited(t *testing.T) {
-	s := start(t, nil)
+	s := start(t, frozen)
 	conv, _, _ := sealedGroup(t, s)
 	tok, _ := tokenFor("e1")
 	limited := 0
@@ -201,5 +210,68 @@ func TestEveryMLSOperationIsReachableOverREST(t *testing.T) {
 		if st == 404 {
 			t.Errorf("/v1/%s has no REST route", op)
 		}
+	}
+}
+
+func TestBehindTheGatewayEachSenderIsLimitedByTheirOwnAddress(t *testing.T) {
+	const edge = "edge-secret-0123456789-abcdef-xyz"
+	s := start(t, func(c *server.Config) { frozen(c); c.EdgeSecret = edge })
+	// Set up over REST as the backend does: the service key acting for a user, with the edge secret.
+	backend := func(user, path string, body map[string]any) (int, []byte) {
+		b, _ := json.Marshal(body)
+		return s.api(acmeKey, "POST", path, b, map[string]string{"X-RTC-User": user, "X-RTC-Edge": edge})
+	}
+	st, b := backend("ada", "/v1/groups", map[string]any{"name": "g", "members": []string{"bob"}})
+	if st != 200 {
+		t.Fatalf("group: %d %s", st, b)
+	}
+	conv, _ := field(b, "id").(string)
+	_, v := tokenFor("e1")
+	if st, b := backend("ada", "/v1/mls/group/create", map[string]any{"conv": conv, "group_id": mb64("g-edge"), "suite": 1}); st != 200 {
+		t.Fatalf("create: %d %s", st, b)
+	}
+	if st, b := backend("ada", "/v1/mls/commit", map[string]any{"conv": conv, "device": "d1", "epoch": 1, "id": "c1", "body": mb64("c"), "sealed_verifier": v}); st != 200 {
+		t.Fatalf("commit: %d %s", st, b)
+	}
+	tok, _ := tokenFor("e1")
+	send := func(xff, id string) int {
+		b, _ := json.Marshal(map[string]any{"tenant": "acme", "conv": conv, "id": id, "body": "x", "epoch": 1, "token": tok})
+		st, _ := s.api("", "POST", "/v1/sealed/send", b, map[string]string{"X-RTC-Edge": edge, "X-Forwarded-For": xff})
+		return st
+	}
+	// One sender, many requests: limited.
+	limited := 0
+	for i := 0; i < 150; i++ {
+		if send("198.51.100.1", fmt.Sprint("a", i)) == 429 {
+			limited++
+		}
+	}
+	if limited == 0 {
+		t.Fatal("one address was never slowed")
+	}
+	// Another sender, through the same gateway, is not slowed by the first.
+	if st := send("198.51.100.2", "other"); st != 200 {
+		t.Fatalf("a different sender behind the same gateway was refused: %d", st)
+	}
+	// A client-supplied list cannot buy a fresh bucket: the gateway's entry is the last one.
+	if st := send("203.0.113.9, 198.51.100.1", "spoof"); st != 429 {
+		t.Fatalf("a forged leading entry escaped the limit: %d", st)
+	}
+}
+
+func TestWithoutAnEdgeSecretTheForwardingHeaderIsNotBelieved(t *testing.T) {
+	s := start(t, frozen)
+	conv, _, _ := sealedGroup(t, s)
+	tok, _ := tokenFor("e1")
+	limited := 0
+	for i := 0; i < 150; i++ {
+		b, _ := json.Marshal(map[string]any{"tenant": "acme", "conv": conv, "id": fmt.Sprint("m", i), "body": "x", "epoch": 1, "token": tok})
+		// Every request claims a different origin; if that were believed none would be limited.
+		if st, _ := s.api("", "POST", "/v1/sealed/send", b, map[string]string{"X-Forwarded-For": fmt.Sprintf("203.0.113.%d", i%250)}); st == 429 {
+			limited++
+		}
+	}
+	if limited == 0 {
+		t.Fatal("a spoofed X-Forwarded-For bought a fresh bucket each time")
 	}
 }

@@ -13,8 +13,8 @@ A WebSocket frame is limited to 64 KiB and a WebSocket reply to 128 KiB: send an
 
 | op | body | what it does |
 |---|---|---|
-| `mls.kp.put` | `device, kps[{kp, last_resort?, ttl?}]` | Publish KeyPackages. At most 100 single-use per device plus one last-resort (a new one replaces the old). `ttl` seconds, default 30 days, max 90. Re-publishing a held package adds nothing. |
-| `mls.kp.count` | `device` | `{available, last_resort}` - top up when low. |
+| `mls.kp.put` | `device, conv?, kps[{kp, last_resort?, ttl?}]` | Publish KeyPackages. At most 100 single-use per device plus one last-resort (a new one replaces the old). `ttl` seconds, default 30 days, max 90. Re-publishing a held package adds nothing. |
+| `mls.kp.count` | `device, conv?` | `{available, last_resort}` - top up when low. |
 | `mls.kp.claim` | `conv, users[]` | One KeyPackage per active device of each user, in one transaction. Caller and users must be in the roster. Single-use are consumed; a device with none left yields its last-resort package (not consumed). Rate limited per caller and person claimed. Returns `{key_packages, missing}`. |
 | `mls.group.create` | `conv, group_id, suite, group_info?` | Bind the conversation to a group at epoch 0. `suite` must be allowed (`Options.MLSSuites`, default 1, 2, 3). |
 | `mls.group.get` | `conv` | `{group_id, suite, epoch, seq, rekey_required, pending_removals, group_info, group_info_epoch}`. Over a socket an oversized `group_info` is omitted (`group_info_omitted`, `group_info_bytes`). |
@@ -91,3 +91,13 @@ the group spoke, not who; the sender is authenticated inside the MLS message, to
   removes them. The removal fence applies (`409 rekey_required`).
 - Rate limited per address and per conversation; body limited.
 - Not hidden: the sender's network address (use a proxy), and the roster.
+
+## Packages for a conversation
+
+An MLS client holds one group, and a KeyPackage's private half lives in the client that made it. A
+device that is in several conversations therefore makes each conversation's packages in that
+conversation's own client. Publish them with `conv` set: the caller must be in the conversation, its
+other members get `mls.kp.ready {conv, user, device}` (so whoever is adding people knows to), and
+`mls.kp.claim {conv}` hands out the conversation's own packages. A device with none for that
+conversation falls back to packages it published for no conversation (the behaviour before this
+existed); it never gets another conversation's. A last-resort package is per device and conversation.
