@@ -504,6 +504,9 @@ func (s *Store) Rotate(ctx context.Context, tenant, conv string, next int64, by,
 		return err
 	}
 	if n, _ := r.RowsAffected(); n == 0 {
+		// End the transaction before looking again: on a database with one connection (SQLite) the read below
+		// would wait for the connection this transaction holds, and never return.
+		_ = tx.Rollback()
 		// An MLS group's epoch moves by commit only; a wrapped key cannot move it.
 		if st, serr := s.stateFresh(ctx, tenant, conv); serr == nil && st.MLS {
 			return fmt.Errorf("%w: this conversation's keys are an MLS group; publish a commit", ErrConflict)

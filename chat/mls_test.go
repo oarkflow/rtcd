@@ -699,3 +699,26 @@ func TestAClaimCanBeLimitedToTheDevicesThatAreNeeded(t *testing.T) {
 		t.Fatalf("a claim for the person: %+v", got)
 	}
 }
+
+// A rotation that loses the race to another member's must say so, not wait: it used to look at the conversation
+// again while its own transaction still held the connection, which on SQLite never returned.
+func TestALostRotationRaceReportsStaleInsteadOfWaiting(t *testing.T) {
+	s := mlsStore(t)
+	if _, _, err := s.PublishDevice(mbg, "t", "ada", "d1", "pub", "", 0); err != nil {
+		t.Fatal(err)
+	}
+	w := []chat.Wrap{{User: "ada", Device: "d1", W: "w"}}
+	if err := s.Rotate(mbg, "t", "race", 1, "ada", "d1", w, []string{"ada"}); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- s.Rotate(mbg, "t", "race", 1, "ada", "d1", w, []string{"ada"}) }()
+	select {
+	case err := <-done:
+		if !errors.Is(err, chat.ErrStale) {
+			t.Fatalf("a rotation that lost the race: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("a rotation that lost the race never returned")
+	}
+}
